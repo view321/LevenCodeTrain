@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Levencode — training dashboard</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Levencode <span class="sub">block-diffusion · Levenshtein edits · JEPA</span></div>
+  <div class="controls">
+    <label for="exp-select" class="muted">experiment</label>
+    <select id="exp-select"></select>
+    <span id="poll-dot" class="poll-dot" title="auto-refresh"></span>
+  </div>
+</header>
+
+<main>
+  <section id="stage-pills" class="pills"></section>
+
+  <section id="stat-tiles" class="tiles"></section>
+
+  <section class="charts">
+    <div class="card chart-card">
+      <div class="card-head">
+        <h3>Training loss <span class="muted" id="loss-sub"></span></h3>
+        <div class="card-actions">
+          <button id="logy-btn" class="ghost" title="toggle log scale">log y</button>
+          <button class="ghost table-toggle" data-chart="loss">table</button>
+        </div>
+      </div>
+      <div id="loss-legend" class="legend"></div>
+      <div id="loss-chart" class="plot"></div>
+    </div>
+    <div class="card chart-card">
+      <div class="card-head">
+        <h3>Loss components <span class="muted" id="comp-sub"></span></h3>
+        <div class="card-actions"><button class="ghost table-toggle" data-chart="comp">table</button></div>
+      </div>
+      <div id="comp-legend" class="legend"></div>
+      <div id="comp-chart" class="plot"></div>
+    </div>
+    <div class="card chart-card">
+      <div class="card-head">
+        <h3>Throughput <span class="muted">tokens/sec</span></h3>
+        <div class="card-actions"><button class="ghost table-toggle" data-chart="speed">table</button></div>
+      </div>
+      <div id="speed-chart" class="plot"></div>
+    </div>
+  </section>
+
+  <section class="card" id="bench-card">
+    <div class="card-head"><h3>Benchmarks <span class="muted">per stage — run at each stage end</span></h3></div>
+    <div id="bench-table"></div>
+  </section>
+
+  <section class="card" id="samples-card">
+    <div class="card-head">
+      <h3>Generation gallery <span class="muted" id="samples-sub"></span></h3>
+      <div class="card-actions"><select id="samples-step"></select></div>
+    </div>
+    <div id="samples"></div>
+  </section>
+
+  <div id="empty-state" class="empty" hidden>
+    <p>No runs yet. Start one on the training box:</p>
+    <pre>python scripts/train.py --config configs/stage1_sft.yaml</pre>
+  </div>
+</main>
+
+<div id="tooltip" class="tooltip" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,86 @@
+"""Loss functions for the diffusion SFT objective, edit heads, and JEPA."""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+IGNORE = -100
+
+
+def diffusion_fill_loss(
+    logits: torch.Tensor,   # [B, L, V]
+    labels: torch.Tensor,   # [B, L] with IGNORE off-block
+    t: torch.Tensor,        # [B] mask rates
+    block_len: torch.Tensor,  # [B]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LLaDA-style weighted masked CE: per-sample (1/t) * sum(CE_masked) / block_len,
+    averaged over the batch. Also returns the unweighted mean CE for logging."""
+    B, L, V = logits.shape
+    ce = F.cross_entropy(
+        logits.reshape(B * L, V).float(), labels.reshape(B * L), ignore_index=IGNORE, reduction="none"
+    ).reshape(B, L)
+    valid = labels != IGNORE
+    per_sample = ce.sum(dim=1)
+    weighted = (per_sample / t.clamp_min(1e-4)) / block_len.clamp_min(1).float()
+    loss = weighted.mean()
+    n_valid = valid.sum().clamp_min(1)
+    mean_ce = (ce * valid).sum() / n_valid
+    return loss, mean_ce.detach()
+
+
+def masked_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Plain masked CE (used for the FILL view where all placeholders count
+    equally). Returns (loss, accuracy)."""
+    B, L, V = logits.shape
+    flat_logits = logits.reshape(B * L, V).float()
+    flat_labels = labels.reshape(B * L)
+    loss = F.cross_entropy(flat_logits, flat_labels, ignore_index=IGNORE)
+    valid = flat_labels != IGNORE
+    if valid.any():
+        acc = (flat_logits.argmax(-1)[valid] == flat_labels[valid]).float().mean()
+    else:
+        acc = torch.zeros((), device=logits.device)
+        loss = logits.sum() * 0.0
+    return loss, acc.detach()
+
+
+def delete_loss(del_logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """BCE over per-token junk labels. labels [B, L] in {0, 1}, IGNORE for pad."""
+    valid = labels != IGNORE
+    if not valid.any():
+        return del_logits.sum() * 0.0, torch.zeros((), device=del_logits.device)
+    target = labels.clamp_min(0).float()
+    raw = F.binary_cross_entropy_with_logits(del_logits.float(), target, reduction="none")
+    loss = (raw * valid).sum() / valid.sum()
+    pred = (torch.sigmoid(del_logits.float()) > 0.5).long()
+    acc = (pred[valid] == labels[valid]).float().mean()
+    return loss, acc.detach()
+
+
+def insert_loss(ins_logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """CE over per-gap insertion counts. ins_logits [B, G, K+1], labels [B, G]."""
+    B, G, C = ins_logits.shape
+    labels = labels[:, :G]
+    loss = F.cross_entropy(
+        ins_logits.reshape(B * G, C).float(), labels.reshape(B * G), ignore_index=IGNORE
+    )
+    valid = labels != IGNORE
+    if valid.any():
+        pred = ins_logits.argmax(-1)
+        acc = (pred[valid] == labels[valid]).float().mean()
+    else:
+        acc = torch.zeros((), device=ins_logits.device)
+        loss = ins_logits.sum() * 0.0
+    return loss, acc.detach()
+
+
+def jepa_loss(
+    predicted: torch.Tensor,  # [B, L, H] predictor output on the corrupted/masked view
+    target: torch.Tensor,     # [B, L, H] EMA-encoder hiddens on the clean view (no grad)
+    positions: torch.Tensor,  # [B, L] bool: where prediction is supervised
+) -> torch.Tensor:
+    if not positions.any():
+        return predicted.sum() * 0.0
+    tgt = F.layer_norm(target.float(), target.shape[-1:])
+    return F.smooth_l1_loss(predicted.float()[positions], tgt[positions])

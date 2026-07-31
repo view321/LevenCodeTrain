@@ -1,0 +1,314 @@
+"""Benchmark tasks: general chat, reasoning (ARC-Easy), math (GSM8K), code
+(MBPP pass@1), plus the differentiated evals (repair, infill) and speed.
+
+Every task returns a flat metrics dict. Dataset-backed tasks load small fixed
+subsets deterministically; failures degrade to {"error": ...} without killing
+the run (the box may be offline for HF datasets)."""
+
+from __future__ import annotations
+
+import ast
+import random
+import re
+from dataclasses import dataclass
+
+import torch
+
+from ..data.corruption import CorruptionCfg, corrupt, make_junk_sampler
+from ..data.tokens import TokenizerBundle
+from ..data.mix import extract_code
+from ..sampling.block_sampler import BlockSamplerCfg, generate
+from ..sampling.edit_sampler import EditSamplerCfg, repair
+from ..util.lev import lev_reduction
+from .fixtures import load_snippets
+from .sandbox import run_python
+
+NUM_RE = re.compile(r"[-+]?\d[\d,]*\.?\d*")
+HASH_ANS_RE = re.compile(r"####\s*([-+]?[\d,]*\.?\d+)")
+
+
+@dataclass
+class BenchCtx:
+    editor: torch.nn.Module
+    bundle: TokenizerBundle
+    cfg: dict
+    device: torch.device
+
+    def sampler_cfg(self) -> BlockSamplerCfg:
+        scfg = BlockSamplerCfg.from_dict(self.cfg.get("sampler", {}))
+        scfg.stop_texts = ("[/Answer]",)
+        scfg.max_blocks = int(self.cfg.get("bench", {}).get("gen_max_blocks", scfg.max_blocks))
+        return scfg
+
+    def bench(self, key: str, default):
+        return self.cfg.get("bench", {}).get(key, default)
+
+
+# ---------- answer parsing ----------
+
+def extract_number(text: str) -> str | None:
+    m = HASH_ANS_RE.findall(text)
+    cand = m[-1] if m else None
+    if cand is None:
+        all_nums = NUM_RE.findall(text)
+        cand = all_nums[-1] if all_nums else None
+    if cand is None:
+        return None
+    return cand.replace(",", "").rstrip(".")
+
+
+def numbers_equal(a: str | None, b: str | None) -> bool:
+    if a is None or b is None:
+        return False
+    try:
+        return abs(float(a) - float(b)) < 1e-4
+    except ValueError:
+        return a == b
+
+
+def syntax_ok(code: str) -> bool:
+    try:
+        ast.parse(code)
+        return True
+    except SyntaxError:
+        return False
+
+
+# ---------- scoring helpers ----------
+
+@torch.no_grad()
+def masked_choice_logprob(ctx: BenchCtx, prompt_ids: list[int], choice_ids: list[int]) -> float:
+    """d1-style single-pass score: fully mask the choice, sum its token
+    log-probs, normalize by length."""
+    b = ctx.bundle
+    x = torch.tensor([prompt_ids + [b.mask_id] * len(choice_ids)], dtype=torch.long, device=ctx.device)
+    logits = ctx.editor.mlm_call()(x)[0].float().log_softmax(-1)
+    pos = range(len(prompt_ids), len(prompt_ids) + len(choice_ids))
+    lp = sum(logits[p, t].item() for p, t in zip(pos, choice_ids))
+    return lp / max(len(choice_ids), 1)
+
+
+@torch.no_grad()
+def masked_answer_ce(ctx: BenchCtx, prefix: list[int], answer: list[int], t: float, seed: int) -> float:
+    """CE on a deterministic subset of answer tokens masked at rate t."""
+    rng = random.Random(seed)
+    b = ctx.bundle
+    ids = list(prefix) + list(answer)
+    masked_pos = [len(prefix) + i for i in range(len(answer)) if rng.random() < t]
+    if not masked_pos:
+        masked_pos = [len(prefix) + rng.randrange(len(answer))]
+    targets = [ids[p] for p in masked_pos]
+    for p in masked_pos:
+        ids[p] = b.mask_id
+    x = torch.tensor([ids], dtype=torch.long, device=ctx.device)
+    logits = ctx.editor.mlm_call()(x)[0].float().log_softmax(-1)
+    ce = -sum(logits[p, t_].item() for p, t_ in zip(masked_pos, targets)) / len(masked_pos)
+    return ce
+
+
+@torch.no_grad()
+def fill_span(ctx: BenchCtx, ids_with_masks: list[int], steps: int = 8) -> list[int]:
+    from ..sampling.edit_sampler import _fill_masks
+
+    x = torch.tensor([ids_with_masks], dtype=torch.long, device=ctx.device)
+    call = ctx.editor.editor_call()
+    x = _fill_masks(call, x, ctx.bundle.mask_id, steps, temperature=0.0, top_p=0.9)
+    return x[0].tolist()
+
+
+# ---------- tasks ----------
+
+def task_chat(ctx: BenchCtx) -> dict:
+    """Held-out chat masked-CE at three mask rates (lower = better)."""
+    from datasets import load_dataset
+
+    n = int(ctx.bench("chat_loss_n", 64))
+    try:
+        ds = load_dataset("HuggingFaceTB/smoltalk", "all", split="test", streaming=True)
+    except Exception:
+        ds = load_dataset("HuggingFaceTB/smoltalk", "all", split="train", streaming=True).skip(50_000)
+    ces = []
+    idx = 0
+    max_len = int(ctx.cfg.get("model", {}).get("max_seq_len", 1024))
+    for ex in ds:
+        msgs = ex.get("messages")
+        if not msgs or msgs[-1].get("role") != "assistant":
+            continue
+        try:
+            prefix, answer = ctx.bundle.chat_pair_ids(msgs)
+        except Exception:
+            continue
+        if not answer or len(prefix) + len(answer) > max_len:
+            continue
+        for ti, t in enumerate((0.15, 0.5, 0.85)):
+            ces.append(masked_answer_ce(ctx, prefix, answer, t, seed=idx * 10 + ti))
+        idx += 1
+        if idx >= n:
+            break
+    if not ces:
+        return {"error": "no usable chat samples"}
+    return {"chat_masked_ce": sum(ces) / len(ces), "n": idx}
+
+
+def task_arc_easy(ctx: BenchCtx) -> dict:
+    from datasets import load_dataset
+
+    n = int(ctx.bench("arc_n", 200))
+    ds = load_dataset("allenai/ai2_arc", "ARC-Easy", split="validation")
+    ds = ds.select(range(min(n, len(ds))))
+    correct = 0
+    total = 0
+    for ex in ds:
+        prompt_ids = ctx.bundle.chat_prompt_ids(
+            [{"role": "user", "content": ex["question"]}]
+        )
+        scores = []
+        for text in ex["choices"]["text"]:
+            choice_ids = ctx.bundle.encode(text.strip())
+            if not choice_ids:
+                scores.append(float("-inf"))
+                continue
+            scores.append(masked_choice_logprob(ctx, prompt_ids, choice_ids))
+        pred = ex["choices"]["label"][scores.index(max(scores))]
+        correct += int(pred == ex["answerKey"])
+        total += 1
+    return {"arc_easy_acc": correct / max(total, 1), "n": total}
+
+
+def task_gsm8k(ctx: BenchCtx) -> dict:
+    from datasets import load_dataset
+
+    n = int(ctx.bench("gsm8k_n", 100))
+    ds = load_dataset("openai/gsm8k", "main", split="test")
+    ds = ds.select(range(min(n, len(ds))))
+    scfg = ctx.sampler_cfg()
+    correct = 0
+    total = 0
+    for ex in ds:
+        prompt_ids = ctx.bundle.chat_prompt_ids(
+            [{
+                "role": "user",
+                "content": ex["question"]
+                + "\nThink step by step and end with the final numeric answer after ####.",
+            }]
+        )
+        res = generate(ctx.editor.mlm_call(), ctx.bundle, prompt_ids, scfg, ctx.device)
+        gold = extract_number(ex["answer"])
+        pred = extract_number(res.text)
+        correct += int(numbers_equal(pred, gold))
+        total += 1
+    return {"gsm8k_em": correct / max(total, 1), "n": total}
+
+
+def task_mbpp(ctx: BenchCtx) -> dict:
+    from datasets import load_dataset
+
+    n = int(ctx.bench("mbpp_n", 50))
+    ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
+    ds = ds.select(range(min(n, len(ds))))
+    scfg = ctx.sampler_cfg()
+    timeout = float(ctx.bench("exec_timeout_s", 5.0))
+    passed = 0
+    total = 0
+    for ex in ds:
+        tests = ex["test_list"]
+        prompt_ids = ctx.bundle.chat_prompt_ids(
+            [{
+                "role": "user",
+                "content": ex["prompt"]
+                + "\nYour code should pass this test:\n"
+                + tests[0]
+                + "\nWrite only the Python code.",
+            }]
+        )
+        res = generate(ctx.editor.mlm_call(), ctx.bundle, prompt_ids, scfg, ctx.device)
+        code = extract_code(res.text)
+        program = code + "\n\n" + "\n".join(tests) + "\n"
+        ok, _detail = run_python(program, timeout)
+        passed += int(ok)
+        total += 1
+    return {"mbpp_pass1": passed / max(total, 1), "n": total}
+
+
+def task_repair(ctx: BenchCtx) -> dict:
+    """Corrupt fixture code with known edits; the editor must recover it
+    self-located (no oracle hints). The signature eval for this project."""
+    n = int(ctx.bench("repair_n", 40))
+    seed = int(ctx.cfg.get("run", {}).get("seed", 1337))
+    b = ctx.bundle
+    ccfg = CorruptionCfg.from_dict(ctx.cfg.get("corruption", {}))
+    ecfg = EditSamplerCfg.from_dict(ctx.cfg.get("edit_sampler", {}))
+    head = [b.bos_id] if b.bos_id is not None else [b.eos_id]
+    exact = 0
+    valid = 0
+    reductions = []
+    total = 0
+    for i, code in enumerate(load_snippets()[:n]):
+        rng = random.Random(seed + i)
+        clean = head + b.encode(code) + [b.eos_id]
+        junk = make_junk_sampler(b.vocab_size, frozenset(b.protected | {b.mask_id}), echo_pool=clean)
+        c = corrupt(clean, rng, ccfg, junk, protected=b.protected)
+        if c.n_junk() + c.n_missing() == 0:
+            continue
+        out, _trace = repair(ctx.editor.editor_call(), b, c.corrupted, ecfg, ctx.device)
+        exact += int(out == clean)
+        valid += int(syntax_ok(b.decode(out)))
+        reductions.append(lev_reduction(c.corrupted, out, clean))
+        total += 1
+    if total == 0:
+        return {"error": "no corrupted samples generated"}
+    return {
+        "repair_exact": exact / total,
+        "repair_syntax_valid": valid / total,
+        "repair_lev_reduction": sum(reductions) / total,
+        "n": total,
+    }
+
+
+def task_infill(ctx: BenchCtx) -> dict:
+    """Mask one middle line of fixture code; exact-match the refill."""
+    n = int(ctx.bench("infill_n", 40))
+    b = ctx.bundle
+    head = [b.bos_id] if b.bos_id is not None else [b.eos_id]
+    exact = 0
+    valid = 0
+    total = 0
+    for code in load_snippets()[:n]:
+        lines = code.rstrip("\n").split("\n")
+        candidates = [i for i in range(1, len(lines) - 1) if lines[i].strip()]
+        if not candidates:
+            continue
+        li = candidates[len(candidates) // 2]
+        pre = "\n".join(lines[:li]) + "\n"
+        line = lines[li]
+        suf = "\n" + "\n".join(lines[li + 1 :]) + "\n"
+        pre_ids, line_ids, suf_ids = b.encode(pre), b.encode(line), b.encode(suf)
+        if not line_ids:
+            continue
+        ids = head + pre_ids + [b.mask_id] * len(line_ids) + suf_ids + [b.eos_id]
+        filled = fill_span(ctx, ids)
+        start = len(head) + len(pre_ids)
+        pred = filled[start : start + len(line_ids)]
+        exact += int(pred == line_ids)
+        valid += int(syntax_ok(b.decode(filled)))
+        total += 1
+    if total == 0:
+        return {"error": "no infillable fixtures"}
+    return {"infill_exact": exact / total, "infill_syntax_valid": valid / total, "n": total}
+
+
+def task_speed(ctx: BenchCtx) -> dict:
+    scfg = ctx.sampler_cfg()
+    scfg.max_blocks = 4
+    prompts = [
+        [{"role": "user", "content": "Write a Python function that reverses a linked list."}],
+        [{"role": "user", "content": "Summarize what unit tests are for."}],
+    ]
+    rates = []
+    for messages in prompts:
+        res = generate(
+            ctx.editor.mlm_call(), ctx.bundle, ctx.bundle.chat_prompt_ids(messages), scfg, ctx.device
+        )
+        if res.new_ids:
+            rates.append(res.tokens_per_sec)
+    return {"gen_tok_per_sec": sum(rates) / max(len(rates), 1)}

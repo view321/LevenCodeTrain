@@ -1,0 +1,108 @@
+# Levencode base configuration. Stage configs extend this via `_extends: base.yaml`.
+
+model:
+  repo_id: LiquidAI/LFM2.5-Encoder-350M-Diffusion
+  dtype: auto                # auto -> bf16 on cuda, f32 on cpu
+  max_seq_len: 1024
+  insert_max: 8              # insertion-count head predicts 0..K masks per gap
+
+run:
+  runs_dir: runs
+  experiment: levencode      # runs land in runs/<experiment>/<stage>
+  seed: 1337
+  device: auto               # auto -> cuda if available else cpu
+
+data:
+  streaming: true
+  shuffle_buffer: 10000
+  # Mix weights are sampling probabilities over interleaved streams.
+  mix:
+    - name: chat
+      dataset: HuggingFaceTB/smoltalk
+      subset: all
+      split: train
+      weight: 0.30
+      kind: chat
+    - name: code_instruct
+      dataset: ise-uiuc/Magicoder-OSS-Instruct-75K
+      subset: null
+      split: train
+      weight: 0.25
+      kind: magicoder
+    - name: math
+      dataset: meta-math/MetaMathQA
+      subset: null
+      split: train
+      weight: 0.20
+      kind: metamath
+    - name: code_raw
+      dataset: codeparrot/codeparrot-clean
+      subset: null
+      split: train
+      weight: 0.25
+      kind: code_raw
+
+diffusion:
+  # Block-pattern masked-diffusion SFT (LLaDA-style objective restricted to a block).
+  block_size_min: 16
+  block_size_max: 128
+  full_answer_prob: 0.30     # fraction of samples trained with the whole answer masked
+  t_min: 0.05                # mask-rate lower bound (t ~ U(t_min, 1))
+  eos_pad: 16                # eos tokens appended after answers so blocks learn to terminate
+
+corruption:
+  p_delete: 0.10             # per-token chance the clean token is dropped
+  p_insert: 0.06             # per-gap chance junk tokens are inserted
+  p_substitute: 0.05         # per-token chance of substitution (delete + junk insert)
+  max_insert_run: 3          # junk insertion run length (uniform 1..max)
+  p_span_delete: 0.02        # chance to start a span deletion
+  max_span: 8                # span deletion length (uniform 2..max)
+
+train:
+  micro_batch_size: 8
+  grad_accum: 8
+  lr: 3.0e-5
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  warmup_steps: 200
+  total_steps: 3000
+  grad_clip: 1.0
+  log_every: 10
+  ckpt_every: 1000
+  sample_every: 500          # dump generation samples for the WebUI gallery
+  loss_weights:
+    fill: 1.0
+    delete: 0.5
+    insert: 0.5
+    jepa: 0.0
+  retain_sft_frac: 0.5       # in edit stages, fraction of batches kept on the SFT objective
+
+jepa:
+  enabled: false
+  predictor_layers: 2
+  predictor_heads: 8
+  ema_start: 0.996
+  ema_end: 0.9995
+
+sampler:
+  block_size: 64
+  steps_per_block: 16
+  max_blocks: 8
+  temperature: 0.0           # 0 -> greedy
+  top_p: 0.9
+
+edit_sampler:
+  rounds: 3
+  delete_threshold: 0.5
+  fill_steps: 8
+
+bench:
+  at_stage_end: true
+  arc_n: 200
+  gsm8k_n: 100
+  mbpp_n: 50
+  chat_loss_n: 64
+  repair_n: 40
+  infill_n: 40
+  gen_max_blocks: 6
+  exec_timeout_s: 5.0

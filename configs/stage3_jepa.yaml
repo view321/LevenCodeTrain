@@ -1,0 +1,18 @@
+# Stage 3: JEPA ablation. Identical to stage 2 but with the JEPA auxiliary
+# objective enabled, branching from the SAME stage-1 checkpoint so the
+# comparison against stage 2 is clean.
+_extends: base.yaml
+
+stage: jepa
+init_from: runs/levencode/sft/ckpt/final
+
+train:
+  total_steps: 2000
+  loss_weights:
+    fill: 1.0
+    delete: 0.5
+    insert: 0.5
+    jepa: 0.5
+
+jepa:
+  enabled: true

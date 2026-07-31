@@ -1,0 +1,9 @@
+# Stage 1: block-pattern masked-diffusion SFT on the reasoning/math/code mix.
+# Adapts the general-instruct diffusion backbone to the domain mix and teaches
+# block-wise (canvas) generation with proper EOS termination.
+_extends: base.yaml
+
+stage: sft
+
+train:
+  total_steps: 3000

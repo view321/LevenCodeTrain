@@ -1,0 +1,14 @@
+# Stage 2: attach Levenshtein edit heads (delete + insertion-count) and train
+# them on synthetic corruption of code, while retaining the SFT objective.
+_extends: base.yaml
+
+stage: edit
+init_from: runs/levencode/sft/ckpt/final
+
+train:
+  total_steps: 2000
+  loss_weights:
+    fill: 1.0
+    delete: 0.5
+    insert: 0.5
+    jepa: 0.0

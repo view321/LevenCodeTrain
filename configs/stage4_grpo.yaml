@@ -1,0 +1,18 @@
+# Stage 4 (EXPERIMENTAL): GRPO/RLVR on the repair task with dense rewards
+# (Levenshtein-distance reduction + syntax validity). Runs from the best of
+# stage 2/3. The trainer for this stage is a skeleton — see train/grpo.py.
+_extends: base.yaml
+
+stage: grpo
+init_from: runs/levencode/edit/ckpt/final
+
+grpo:
+  group_size: 8
+  prompts_per_step: 4
+  total_steps: 300
+  lr: 1.0e-6
+  clip_eps: 0.2
+  reward:
+    w_lev: 1.0
+    w_syntax: 0.3
+    w_exact: 1.0
