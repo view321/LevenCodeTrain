@@ -145,6 +145,18 @@ def test_grad_checkpoint_matches(model, cfg):
     assert torch.allclose(out_a["loss"], out_b["loss"], atol=1e-5)
 
 
+def test_autocast_bf16_forward_backward(model, cfg):
+    """Regression: the 5090 run died on index_add_ dtype mismatch — experts
+    emit bf16 under autocast while the fp32 residual stream owns the buffer."""
+    torch.manual_seed(9)
+    model.train()
+    ids = torch.randint(0, cfg.vocab_size, (2, 12))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = model(ids, labels=ids)
+    assert torch.isfinite(out["loss"])
+    out["loss"].backward()
+
+
 def test_param_report_keys(model):
     rep = param_report(model)
     assert rep["total"] > rep["active_compute_per_token(excl. head)"] > 0

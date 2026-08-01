@@ -131,7 +131,9 @@ class MoELayer(nn.Module):
             if rows.numel() == 0:
                 continue
             y = self.experts[e](flat[rows])
-            out.index_add_(0, rows, y * top_p[rows, slot].unsqueeze(-1).to(y.dtype))
+            # under autocast the experts emit bf16 while the residual stream
+            # (and hence `out`) is fp32 — index_add_ demands matching dtypes
+            out.index_add_(0, rows, (y * top_p[rows, slot].unsqueeze(-1)).to(out.dtype))
         if self.shared is not None:
             out = out + self.shared(flat)
         # Switch-style load balance: E * sum_e f_e * P_e  (f = routed fraction)
