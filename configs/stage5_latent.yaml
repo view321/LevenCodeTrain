@@ -20,7 +20,8 @@ run:
 
 latent:
   enabled: true
-  store: runs/precompute/demo
+  store: runs/precompute/demo_v2   # v2: rebuilt with the fixed chunker — never
+                                   # train against the pre-fix store
 
 diffusion:
   # The latent filler works in fine_chunk_tokens=8 canvases, but stages 1-2
