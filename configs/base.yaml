@@ -87,6 +87,18 @@ jepa:
   ema_start: 0.996
   ema_end: 0.9995
 
+rollin:
+  enabled: false             # roll-in: train edit heads on the model's own outputs
+  frac: 0.35                 # fraction of edit micro-batches from the roll-in buffer
+  refresh_every: 200         # optimizer steps between buffer regenerations
+  buffer_size: 256
+  max_len: 512
+  mode_mix: 0.5              # P(repair-mode rollout) vs fill-mode rollout
+  sampler:
+    rounds: 1
+    fill_steps: 6
+    temperature: 0.7
+
 sampler:
   block_size: 64
   steps_per_block: 16

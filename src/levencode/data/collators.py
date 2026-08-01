@@ -177,50 +177,62 @@ class EditCollator:
         return c  # identity corruption: all-zero labels are still valid supervision
 
     def __call__(self, samples: list[dict]) -> dict | None:
-        del_rows, del_labs = [], []
-        ins_rows, ins_labs = [], []
-        fill_rows, fill_labs = [], []
+        corruptions = []
         for sample in samples:
             text = sample.get("text")
             if not text:
                 continue
             c = self._corrupt_one(text)
-            if c is None:
-                continue
+            if c is not None:
+                corruptions.append(c)
+        return build_edit_views(corruptions, self.b, self.k, self.max_len)
 
-            del_rows.append(list(c.corrupted))
-            del_labs.append(c.delete_labels())
 
-            kept = c.kept_sequence()
-            gaps = c.gap_counts()
-            ins_rows.append(kept)
-            ins_labs.append([min(g, self.k) for g in gaps] + [IGNORE])  # no gap after last token
+def build_edit_views(
+    corruptions: list[Corruption],
+    bundle: TokenizerBundle,
+    insert_max: int,
+    max_len: int,
+) -> dict | None:
+    """The three training views from Corruption objects — shared between the
+    synthetic-corruption collator and alignment-derived roll-in batches."""
+    del_rows, del_labs = [], []
+    ins_rows, ins_labs = [], []
+    fill_rows, fill_labs = [], []
+    for c in corruptions:
+        del_rows.append(list(c.corrupted))
+        del_labs.append(c.delete_labels())
 
-            fill_ids: list[int] = []
-            fill_lab: list[int] = []
-            missing = c.gap_missing_tokens()
-            for i, tok in enumerate(kept):
-                fill_ids.append(tok)
-                fill_lab.append(IGNORE)
-                if i < len(missing):
-                    for m in missing[i]:
-                        fill_ids.append(self.b.mask_id)
-                        fill_lab.append(m)
-            fill_rows.append(fill_ids[: self.max_len])
-            fill_labs.append(fill_lab[: self.max_len])
+        kept = c.kept_sequence()
+        gaps = c.gap_counts()
+        ins_rows.append(kept)
+        ins_labs.append([min(g, insert_max) for g in gaps] + [IGNORE])  # no gap after last token
 
-        if not del_rows:
-            return None
+        fill_ids: list[int] = []
+        fill_lab: list[int] = []
+        missing = c.gap_missing_tokens()
+        for i, tok in enumerate(kept):
+            fill_ids.append(tok)
+            fill_lab.append(IGNORE)
+            if i < len(missing):
+                for m in missing[i]:
+                    fill_ids.append(bundle.mask_id)
+                    fill_lab.append(m)
+        fill_rows.append(fill_ids[:max_len])
+        fill_labs.append(fill_lab[:max_len])
 
-        def view(rows: list[list[int]], labs: list[list[int]]) -> dict:
-            return {
-                "input_ids": _pad_batch(rows, self.b.pad_id),
-                "attention_mask": _attention_from(rows),
-                "labels": _pad_batch(labs, IGNORE),
-            }
+    if not del_rows:
+        return None
 
+    def view(rows: list[list[int]], labs: list[list[int]]) -> dict:
         return {
-            "del": view(del_rows, del_labs),
-            "ins": view(ins_rows, ins_labs),
-            "fill": view(fill_rows, fill_labs),
+            "input_ids": _pad_batch(rows, bundle.pad_id),
+            "attention_mask": _attention_from(rows),
+            "labels": _pad_batch(labs, IGNORE),
         }
+
+    return {
+        "del": view(del_rows, del_labs),
+        "ins": view(ins_rows, ins_labs),
+        "fill": view(fill_rows, fill_labs),
+    }

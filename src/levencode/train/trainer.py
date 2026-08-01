@@ -37,6 +37,7 @@ from .losses import (
     jepa_loss,
     masked_ce_loss_sparse,
 )
+from .rollin import RollinBuffer, RollinCfg
 from .state import RunDir
 
 GALLERY_PROMPTS = [
@@ -114,8 +115,22 @@ class Trainer:
         self._sft_iter = sft_iter
         self._edit_iter = edit_iter
 
+        self.rollin_cfg = RollinCfg.from_dict(cfg.get("rollin", {}))
+        self.rollin: RollinBuffer | None = None
+        if self.stage in ("edit", "jepa") and self.rollin_cfg.enabled:
+            self.rollin = RollinBuffer(
+                self.rollin_cfg,
+                self.bundle,
+                CorruptionCfg.from_dict(cfg.get("corruption", {})),
+                insert_max=int(cfg_get(cfg, "model.insert_max", 8)),
+                max_seq_len=max_len,
+                seed=seed,
+            )
+
+        # run.name lets variant runs (e.g. edit_rollin) live beside their stage
+        self.run_name = cfg_get(cfg, "run.name", None) or self.stage
         runs_root = Path(cfg_get(cfg, "run.runs_dir", "runs")) / cfg_get(cfg, "run.experiment", "levencode")
-        self.run = RunDir(run_dir or runs_root / self.stage)
+        self.run = RunDir(run_dir or runs_root / self.run_name)
 
         t = cfg["train"]
         self.micro_bs = int(t["micro_batch_size"])
@@ -296,6 +311,11 @@ class Trainer:
 
         try:
             for step in range(1, self.total_steps + 1):
+                if self.rollin is not None and (step - 1) % self.rollin_cfg.refresh_every == 0:
+                    stats = self.rollin.refresh(self.editor, self.edit_stream(), self.device)
+                    window.add("rollin_edit_mass", stats["rollin_edit_mass"])
+                    window.add("rollin_pairs", float(stats["rollin_pairs"]))
+
                 lr = self._lr_at(step - 1)
                 for g in self.opt.param_groups:
                     g["lr"] = lr
@@ -306,10 +326,22 @@ class Trainer:
                 for _ in range(self.grad_accum):
                     use_edit = self.stage in ("edit", "jepa") and self.rng.random() > self.retain_frac
                     if use_edit:
-                        batch = self._to(
-                            self._next_batch(self.edit_collator, self.edit_stream(), self.edit_micro_bs),
-                            self.device,
+                        batch = None
+                        from_rollin = (
+                            self.rollin is not None
+                            and self.rollin.ready()
+                            and self.rng.random() < self.rollin_cfg.frac
                         )
+                        if from_rollin:
+                            batch = self.rollin.batch(self.edit_micro_bs)
+                        if batch is None:
+                            from_rollin = False
+                            batch = self._next_batch(
+                                self.edit_collator, self.edit_stream(), self.edit_micro_bs
+                            )
+                        batch = self._to(batch, self.device)
+                        if self.rollin is not None:
+                            window.add("rollin_frac", 1.0 if from_rollin else 0.0)
                         n_edit += 1
                         loss_val = self._edit_step(batch, window)
                         n_tok = sum(v["input_ids"].numel() for v in batch.values())
@@ -363,7 +395,7 @@ class Trainer:
                 from ..bench.benchmark import run_benchmark
 
                 results = run_benchmark(self.editor, self.bundle, self.cfg, self.device)
-                self.run.save_bench(self.stage, results)
+                self.run.save_bench(self.run_name, results)
 
             self.run.finish("completed")
         except Exception:

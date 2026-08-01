@@ -1,0 +1,19 @@
+# Stage 2b: roll-in continuation of the edit stage. Starts from the stage-2
+# checkpoint and mixes in edit batches whose labels come from aligning the
+# model's OWN outputs (imperfect repairs, stochastic self-fills) against the
+# reference — attacking the localization gap (oracle 68% vs self-located 15.6%)
+# and the draft-distribution mismatch seen in MBPP self-repair.
+_extends: base.yaml
+
+stage: edit
+init_from: runs/levencode/edit/ckpt/final
+
+run:
+  name: edit_rollin
+
+train:
+  total_steps: 1500
+  lr: 2.0e-5
+
+rollin:
+  enabled: true

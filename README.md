@@ -28,8 +28,19 @@ On top of it, this repo adds:
 |---|---|---|---|
 | 1 `sft` | `configs/stage1_sft.yaml` | HF repo | Block-pattern masked-diffusion SFT on the data mix; teaches canvas generation + EOS |
 | 2 `edit` | `configs/stage2_edit.yaml` | stage 1 | Adds edit heads, trains on synthetic corruption (+ SFT retention) |
+| 2b `edit_rollin` | `configs/stage2b_rollin.yaml` | stage 2 | **Roll-in**: edit labels from aligning the model's own outputs against references |
 | 3 `jepa` | `configs/stage3_jepa.yaml` | stage 1 | Same as stage 2 **plus** JEPA loss — clean ablation vs stage 2 |
 | 4 `grpo` | `configs/stage4_grpo.yaml` | stage 2 | Experimental RLVR on repair |
+
+Roll-in (stage 2b) attacks the two gaps synthetic corruption can't: the
+localization gap (heads must fix states the *model* visits, not just random
+noise) and the draft-distribution mismatch (self-authored decoherence). A
+buffer regenerates hypothesis/reference pairs with the current weights every
+`rollin.refresh_every` steps — half imperfect self-repairs, half stochastic
+self-fills — recovers edit labels via a Levenshtein alignment backtrace
+(`data/alignment.py`), and serves them through the standard edit views. Watch
+`rollin_edit_mass` in the metrics: it is the mean edit distance of the model's
+own outputs from the reference, and should FALL as roll-in training works.
 
 Data mix (streamed from HF, weights in `configs/base.yaml`): smoltalk (chat +
 reasoning) 30%, Magicoder-OSS-Instruct (code) 25%, MetaMathQA (math) 20%,
