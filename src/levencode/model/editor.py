@@ -31,6 +31,15 @@ class LevencodeEditor(nn.Module):
     def insert_max(self) -> int:
         return self.heads.insert_max
 
+    def hidden(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Base-encoder hidden states only — no LM-head logits. The training
+        path uses this and applies lm_head just at supervised positions; the
+        full-vocab logits tensor is the largest allocation in a step and most
+        views never need it."""
+        return self.backbone.lfm2(
+            input_ids=input_ids, attention_mask=attention_mask, return_dict=True
+        ).last_hidden_state
+
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor | None = None) -> dict:
         h, mlm_logits = hidden_and_logits(self.backbone, input_ids, attention_mask)
         del_logits, ins_logits = self.heads(h)

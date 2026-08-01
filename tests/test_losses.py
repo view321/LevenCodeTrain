@@ -4,9 +4,11 @@ from levencode.train.losses import (
     IGNORE,
     delete_loss,
     diffusion_fill_loss,
+    diffusion_fill_loss_sparse,
     insert_loss,
     jepa_loss,
     masked_ce_loss,
+    masked_ce_loss_sparse,
 )
 
 
@@ -80,6 +82,25 @@ def test_insert_loss_slices_labels():
     assert labels.shape[1] == L
     assert 0.5 < acc.item() < 1.0  # gaps 0 and 2 right, gap 1 wrong
     assert loss.item() > 0
+
+
+def test_sparse_losses_match_dense():
+    """The memory-efficient gathered-position losses must equal the dense ones
+    exactly — they are what the trainer actually uses."""
+    logits, labels, t, block_len = make_batch()
+    dense, dense_ce = diffusion_fill_loss(logits, labels, t, block_len)
+
+    b_idx, pos = (labels != IGNORE).nonzero(as_tuple=True)
+    logits_sel = logits[b_idx, pos]
+    labels_sel = labels[b_idx, pos]
+    sparse, sparse_ce = diffusion_fill_loss_sparse(logits_sel, labels_sel, b_idx, t, block_len)
+    assert torch.isclose(dense, sparse, rtol=1e-5)
+    assert torch.isclose(dense_ce, sparse_ce, rtol=1e-5)
+
+    d_ml, d_acc = masked_ce_loss(logits, labels)
+    s_ml, s_acc = masked_ce_loss_sparse(logits_sel, labels_sel)
+    assert torch.isclose(d_ml, s_ml, rtol=1e-5)
+    assert torch.isclose(d_acc, s_acc, rtol=1e-5)
 
 
 def test_jepa_loss():

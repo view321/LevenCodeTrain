@@ -60,6 +60,7 @@ corruption:
 
 train:
   micro_batch_size: 8
+  edit_micro_batch_size: null   # edit batches run 3 view forwards; null -> micro_batch_size // 2
   grad_accum: 8
   lr: 3.0e-5
   weight_decay: 0.1

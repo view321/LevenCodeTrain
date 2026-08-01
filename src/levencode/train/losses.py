@@ -29,6 +29,32 @@ def diffusion_fill_loss(
     return loss, mean_ce.detach()
 
 
+def diffusion_fill_loss_sparse(
+    logits_sel: torch.Tensor,  # [N, V] logits at supervised positions only
+    labels_sel: torch.Tensor,  # [N]
+    b_idx: torch.Tensor,       # [N] batch row of each supervised position
+    t: torch.Tensor,           # [B]
+    block_len: torch.Tensor,   # [B]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Identical value to diffusion_fill_loss, but computed from gathered
+    logits so the full [B, L, V] tensor never has to exist in fp32."""
+    B = t.shape[0]
+    ce = F.cross_entropy(logits_sel.float(), labels_sel, reduction="none")  # [N]
+    per_sample = torch.zeros(B, device=ce.device, dtype=ce.dtype).index_add_(0, b_idx, ce)
+    weighted = (per_sample / t.clamp_min(1e-4)) / block_len.clamp_min(1).float()
+    return weighted.mean(), ce.mean().detach()
+
+
+def masked_ce_loss_sparse(
+    logits_sel: torch.Tensor, labels_sel: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if labels_sel.numel() == 0:
+        return logits_sel.sum() * 0.0, torch.zeros((), device=logits_sel.device)
+    loss = F.cross_entropy(logits_sel.float(), labels_sel)
+    acc = (logits_sel.argmax(-1) == labels_sel).float().mean()
+    return loss, acc.detach()
+
+
 def masked_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Plain masked CE (used for the FILL view where all placeholders count
     equally). Returns (loss, accuracy)."""

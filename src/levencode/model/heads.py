@@ -22,8 +22,12 @@ class EditHeads(nn.Module):
             nn.Linear(2 * hidden_size, mid), nn.GELU(), nn.Linear(mid, insert_max + 1)
         )
 
-    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        del_logits = self.delete(h).squeeze(-1)  # [B, L]
+    def delete_logits(self, h: torch.Tensor) -> torch.Tensor:
+        return self.delete(h).squeeze(-1)  # [B, L]
+
+    def insert_logits(self, h: torch.Tensor) -> torch.Tensor:
         pair = torch.cat([h[:, :-1, :], h[:, 1:, :]], dim=-1)  # [B, L-1, 2H]
-        ins_logits = self.insert(pair)  # [B, L-1, K+1]
-        return del_logits, ins_logits
+        return self.insert(pair)  # [B, L-1, K+1]
+
+    def forward(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.delete_logits(h), self.insert_logits(h)

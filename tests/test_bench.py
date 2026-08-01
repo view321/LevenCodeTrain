@@ -50,6 +50,23 @@ def test_sandbox_timeout():
 
 
 @pytest.mark.network
+def test_pll_scorer_on_tiny_model(bundle):
+    from levencode.bench.tasks import BenchCtx, pll_choice_logprob
+    from levencode.model.backbone import tiny_backbone
+    from levencode.model.editor import LevencodeEditor
+
+    torch.manual_seed(0)
+    editor = LevencodeEditor(tiny_backbone(), insert_max=4)
+    editor.eval()
+    ctx = BenchCtx(editor=editor, bundle=bundle, cfg={}, device=torch.device("cpu"))
+    prompt = bundle.chat_prompt_ids([{"role": "user", "content": "pick one"}])
+    lp_short = pll_choice_logprob(ctx, prompt, bundle.encode("blue sky"))
+    lp_long = pll_choice_logprob(ctx, prompt, bundle.encode("a much longer answer with many words"))
+    assert lp_short < 0 and lp_long < 0
+    assert abs(lp_short) < 50 and abs(lp_long) < 50  # length-normalized, sane scale
+
+
+@pytest.mark.network
 def test_offline_tasks_run_on_tiny_model(bundle):
     """repair / infill / speed must execute end-to-end on the tiny real
     architecture (garbage quality, but exercised mechanics + report shape)."""

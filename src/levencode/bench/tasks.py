@@ -77,15 +77,32 @@ def syntax_ok(code: str) -> bool:
 # ---------- scoring helpers ----------
 
 @torch.no_grad()
-def masked_choice_logprob(ctx: BenchCtx, prompt_ids: list[int], choice_ids: list[int]) -> float:
-    """d1-style single-pass score: fully mask the choice, sum its token
-    log-probs, normalize by length."""
+def pll_choice_logprob(
+    ctx: BenchCtx, prompt_ids: list[int], choice_ids: list[int], chunk: int = 8, max_tokens: int = 48
+) -> float:
+    """Pseudo-log-likelihood (BERT-style): for token i, mask ONLY position i
+    (rest of the choice visible) and take its log-prob; average over tokens.
+    Far better calibrated than the fully-masked mean-field estimate, which
+    scored multiple-choice at chance level."""
     b = ctx.bundle
-    x = torch.tensor([prompt_ids + [b.mask_id] * len(choice_ids)], dtype=torch.long, device=ctx.device)
-    logits = ctx.editor.mlm_call()(x)[0].float().log_softmax(-1)
-    pos = range(len(prompt_ids), len(prompt_ids) + len(choice_ids))
-    lp = sum(logits[p, t].item() for p, t in zip(pos, choice_ids))
-    return lp / max(len(choice_ids), 1)
+    choice_ids = choice_ids[:max_tokens]
+    L = len(choice_ids)
+    base = prompt_ids + choice_ids
+    start = len(prompt_ids)
+    rows = []
+    for i in range(L):
+        row = list(base)
+        row[start + i] = b.mask_id
+        rows.append(row)
+    total = 0.0
+    for c0 in range(0, L, chunk):
+        batch = rows[c0 : c0 + chunk]
+        x = torch.tensor(batch, dtype=torch.long, device=ctx.device)
+        logits = ctx.editor.mlm_call()(x).float().log_softmax(-1)
+        for j in range(len(batch)):
+            i = c0 + j
+            total += logits[j, start + i, choice_ids[i]].item()
+    return total / max(L, 1)
 
 
 @torch.no_grad()
@@ -168,7 +185,7 @@ def task_arc_easy(ctx: BenchCtx) -> dict:
             if not choice_ids:
                 scores.append(float("-inf"))
                 continue
-            scores.append(masked_choice_logprob(ctx, prompt_ids, choice_ids))
+            scores.append(pll_choice_logprob(ctx, prompt_ids, choice_ids))
         pred = ex["choices"]["label"][scores.index(max(scores))]
         correct += int(pred == ex["answerKey"])
         total += 1

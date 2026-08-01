@@ -26,7 +26,13 @@ from ..model.editor import LevencodeEditor, build_editor
 from ..model.jepa import ema_momentum
 from ..sampling.block_sampler import BlockSamplerCfg, generate
 from ..util import resolve_device, set_seed
-from .losses import delete_loss, diffusion_fill_loss, insert_loss, jepa_loss, masked_ce_loss
+from .losses import (
+    delete_loss,
+    diffusion_fill_loss_sparse,
+    insert_loss,
+    jepa_loss,
+    masked_ce_loss_sparse,
+)
 from .state import RunDir
 
 GALLERY_PROMPTS = [
@@ -88,6 +94,8 @@ class Trainer:
 
         t = cfg["train"]
         self.micro_bs = int(t["micro_batch_size"])
+        # Edit micro-batches run three view forwards each; default them smaller.
+        self.edit_micro_bs = int(t.get("edit_micro_batch_size") or max(self.micro_bs // 2, 1))
         self.grad_accum = int(t["grad_accum"])
         self.total_steps = int(t["total_steps"])
         self.grad_clip = float(t.get("grad_clip", 1.0))
@@ -141,9 +149,9 @@ class Trainer:
             self._edit_iter = build_edit_stream(self.cfg["data"], int(cfg_get(self.cfg, "run.seed", 1337)))
         return self._edit_iter
 
-    def _next_batch(self, collator, stream: Iterator[dict]) -> dict:
+    def _next_batch(self, collator, stream: Iterator[dict], micro_bs: int) -> dict:
         for _ in range(50):
-            samples = [next(stream) for _ in range(self.micro_bs)]
+            samples = [next(stream) for _ in range(micro_bs)]
             batch = collator(samples)
             if batch is not None:
                 return batch
@@ -157,6 +165,11 @@ class Trainer:
         }
 
     # ---------- losses ----------
+    # Each _*_step computes, scales, and BACKWARDS its own losses view by view,
+    # so at most one view's activation graph is alive at a time. Combined with
+    # applying lm_head only at supervised positions (never materializing the
+    # full [B, L, 65k] logits in the training path), this is what keeps the
+    # edit/jepa stages inside 32GB.
 
     def _jepa_term(self, hidden: torch.Tensor, input_ids: torch.Tensor, labels: torch.Tensor, att: torch.Tensor) -> torch.Tensor:
         positions = labels != IGNORE
@@ -165,42 +178,69 @@ class Trainer:
         pred = self.editor.jepa.predict(hidden, att)
         return jepa_loss(pred, target, positions)
 
-    def _sft_losses(self, batch: dict, metrics: dict) -> torch.Tensor:
-        out = self.editor(batch["input_ids"], batch["attention_mask"])
-        loss_fill, ce = diffusion_fill_loss(out["mlm_logits"], batch["labels"], batch["t"], batch["block_len"])
-        total = float(self.loss_w.get("fill", 1.0)) * loss_fill
+    def _gathered_logits(self, h: torch.Tensor, labels: torch.Tensor):
+        b_idx, pos = (labels != IGNORE).nonzero(as_tuple=True)
+        logits_sel = self.backbone_lm_head(h[b_idx, pos])
+        return logits_sel, labels[b_idx, pos], b_idx
+
+    @property
+    def backbone_lm_head(self):
+        return self.editor.backbone.lm_head
+
+    def _sft_step(self, batch: dict, metrics: dict) -> float:
+        with self.autocast:
+            h = self.editor.hidden(batch["input_ids"], batch["attention_mask"])
+            logits_sel, labels_sel, b_idx = self._gathered_logits(h, batch["labels"])
+            loss_fill, ce = diffusion_fill_loss_sparse(
+                logits_sel, labels_sel, b_idx, batch["t"], batch["block_len"]
+            )
+            total = float(self.loss_w.get("fill", 1.0)) * loss_fill
+            if self.with_jepa:
+                jl = self._jepa_term(h, batch["input_ids"], batch["labels"], batch["attention_mask"])
+                total = total + float(self.loss_w.get("jepa", 0.0)) * jl
+                metrics["jepa_loss"] = metrics.get("jepa_loss", 0.0) + jl.item()
+        (total / self.grad_accum).backward()
         metrics["fill_loss"] = metrics.get("fill_loss", 0.0) + loss_fill.item()
         metrics["ce"] = metrics.get("ce", 0.0) + ce.item()
-        if self.with_jepa:
-            jl = self._jepa_term(out["hidden"], batch["input_ids"], batch["labels"], batch["attention_mask"])
-            total = total + float(self.loss_w.get("jepa", 0.0)) * jl
-            metrics["jepa_loss"] = metrics.get("jepa_loss", 0.0) + jl.item()
-        return total
+        return total.item()
 
-    def _edit_losses(self, batch: dict, metrics: dict) -> torch.Tensor:
+    def _edit_step(self, batch: dict, metrics: dict) -> float:
         d, i, f = batch["del"], batch["ins"], batch["fill"]
-        out_d = self.editor(d["input_ids"], d["attention_mask"])
-        dl, dacc = delete_loss(out_d["del_logits"], d["labels"])
-        out_i = self.editor(i["input_ids"], i["attention_mask"])
-        il, iacc = insert_loss(out_i["ins_logits"], i["labels"])
-        out_f = self.editor(f["input_ids"], f["attention_mask"])
-        fl, facc = masked_ce_loss(out_f["mlm_logits"], f["labels"])
-        total = (
-            float(self.loss_w.get("delete", 0.5)) * dl
-            + float(self.loss_w.get("insert", 0.5)) * il
-            + float(self.loss_w.get("fill", 1.0)) * fl
-        )
+        total_display = 0.0
+
+        with self.autocast:
+            h_d = self.editor.hidden(d["input_ids"], d["attention_mask"])
+            dl, dacc = delete_loss(self.editor.heads.delete_logits(h_d), d["labels"])
+            scaled = float(self.loss_w.get("delete", 0.5)) * dl
+        (scaled / self.grad_accum).backward()
+        total_display += scaled.item()
+
+        with self.autocast:
+            h_i = self.editor.hidden(i["input_ids"], i["attention_mask"])
+            il, iacc = insert_loss(self.editor.heads.insert_logits(h_i), i["labels"])
+            scaled = float(self.loss_w.get("insert", 0.5)) * il
+        (scaled / self.grad_accum).backward()
+        total_display += scaled.item()
+
+        with self.autocast:
+            h_f = self.editor.hidden(f["input_ids"], f["attention_mask"])
+            logits_sel, labels_sel, _ = self._gathered_logits(h_f, f["labels"])
+            fl, facc = masked_ce_loss_sparse(logits_sel, labels_sel)
+            scaled = float(self.loss_w.get("fill", 1.0)) * fl
+            if self.with_jepa:
+                jl = self._jepa_term(h_f, f["input_ids"], f["labels"], f["attention_mask"])
+                scaled = scaled + float(self.loss_w.get("jepa", 0.0)) * jl
+                metrics["jepa_loss"] = metrics.get("jepa_loss", 0.0) + jl.item()
+        (scaled / self.grad_accum).backward()
+        total_display += scaled.item()
+
         metrics["del_loss"] = metrics.get("del_loss", 0.0) + dl.item()
         metrics["del_acc"] = metrics.get("del_acc", 0.0) + dacc.item()
         metrics["ins_loss"] = metrics.get("ins_loss", 0.0) + il.item()
         metrics["ins_acc"] = metrics.get("ins_acc", 0.0) + iacc.item()
         metrics["fill_view_loss"] = metrics.get("fill_view_loss", 0.0) + fl.item()
         metrics["fill_view_acc"] = metrics.get("fill_view_acc", 0.0) + facc.item()
-        if self.with_jepa:
-            jl = self._jepa_term(out_f["hidden"], f["input_ids"], f["labels"], f["attention_mask"])
-            total = total + float(self.loss_w.get("jepa", 0.0)) * jl
-            metrics["jepa_loss"] = metrics.get("jepa_loss", 0.0) + jl.item()
-        return total
+        return total_display
 
     # ---------- main loop ----------
 
@@ -224,18 +264,21 @@ class Trainer:
                 for _ in range(self.grad_accum):
                     use_edit = self.stage in ("edit", "jepa") and self.rng.random() > self.retain_frac
                     if use_edit:
-                        batch = self._to(self._next_batch(self.edit_collator, self.edit_stream()), self.device)
+                        batch = self._to(
+                            self._next_batch(self.edit_collator, self.edit_stream(), self.edit_micro_bs),
+                            self.device,
+                        )
                         n_edit += 1
-                    else:
-                        batch = self._to(self._next_batch(self.sft_collator, self.sft_stream()), self.device)
-                    with self.autocast:
-                        loss = self._edit_losses(batch, metrics) if use_edit else self._sft_losses(batch, metrics)
-                    (loss / self.grad_accum).backward()
-                    accum_loss += loss.item() / self.grad_accum
-                    if use_edit:
+                        loss_val = self._edit_step(batch, metrics)
                         n_tok = sum(v["input_ids"].numel() for v in batch.values())
                     else:
+                        batch = self._to(
+                            self._next_batch(self.sft_collator, self.sft_stream(), self.micro_bs),
+                            self.device,
+                        )
+                        loss_val = self._sft_step(batch, metrics)
                         n_tok = batch["input_ids"].numel()
+                    accum_loss += loss_val / self.grad_accum
                     tokens_seen += n_tok
                     window_tokens += n_tok
 

@@ -104,6 +104,13 @@ That fits the "couple of days" budget with room for a config iteration. Raise
 `total_steps` if curves are still dropping. If VRAM allows (watch the WebUI
 tok/s), raise `micro_batch_size` before anything else.
 
+Memory notes: the trainer backwards each edit view separately and computes
+LM-head logits only at supervised positions, so edit/jepa stages fit
+comfortably in 32GB at the defaults. Edit micro-batches default to half of
+`micro_batch_size` (three view forwards each) — override with
+`train.edit_micro_batch_size`. If you still hit OOM, lower that first;
+`scripts/train.py` also enables `expandable_segments` to curb fragmentation.
+
 ## Layout
 
 ```
