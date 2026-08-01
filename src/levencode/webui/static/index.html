@@ -24,8 +24,9 @@
   <section class="charts">
     <div class="card chart-card">
       <div class="card-head">
-        <h3>Training loss <span class="muted" id="loss-sub"></span></h3>
+        <h3>Learning curve <span class="muted" id="loss-sub"></span></h3>
         <div class="card-actions">
+          <button id="smooth-btn" class="ghost" title="toggle EMA smoothing" aria-pressed="true">smooth</button>
           <button id="logy-btn" class="ghost" title="toggle log scale">log y</button>
           <button class="ghost table-toggle" data-chart="loss">table</button>
         </div>

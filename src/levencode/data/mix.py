@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import random
 import re
+import time
 from typing import Any, Callable, Iterator
 
 Normalizer = Callable[[dict], dict | None]
@@ -79,7 +80,16 @@ def hf_stream_factory(entry: dict, seed: int, shuffle_buffer: int) -> Callable[[
 
 class WeightedMixer:
     """Samples a stream per step according to weights; exhausted streams restart
-    with a bumped epoch seed, so the mixture never runs dry."""
+    with a bumped epoch seed, so the mixture never runs dry.
+
+    Streaming HF datasets fail transiently (network hiccups, hub 5xx); a
+    multi-hour run must not die for that. A failing stream is rebuilt with
+    backoff, then benched for COOLDOWN_S while the rest of the mixture carries
+    on; only when every draw keeps failing does the mixer raise."""
+
+    RETRY_DELAYS_S = (1.0, 3.0, 10.0, 30.0)  # in-call backoff before benching
+    COOLDOWN_S = 120.0                       # how long a failed stream sits out
+    MAX_CONSECUTIVE_MISSES = 20              # then the mixture raises
 
     def __init__(self, entries: list[dict], factories: dict[str, Callable[[int], Iterator[dict]]], seed: int):
         self.entries = entries
@@ -91,23 +101,66 @@ class WeightedMixer:
         self.iters: dict[str, Iterator[dict]] = {}
         self.epochs: dict[str, int] = {n: 0 for n in self.names}
 
+    def _rebuild(self, name: str) -> None:
+        # Bump the epoch even on error rebuilds: the reshuffle avoids
+        # re-walking the identical stream prefix after a mid-stream failure.
+        self.epochs[name] += 1
+        self.iters.pop(name, None)
+
     def _next_from(self, name: str) -> dict | None:
-        if name not in self.iters:
-            self.iters[name] = self.factories[name](self.epochs[name])
-        for _ in range(2):
+        exhausted = 0
+        errors = 0
+        while True:
             try:
+                if name not in self.iters:
+                    self.iters[name] = self.factories[name](self.epochs[name])
                 return next(self.iters[name])
-            except StopIteration:
-                self.epochs[name] += 1
-                self.iters[name] = self.factories[name](self.epochs[name])
-        return None
+            except StopIteration:  # normal exhaustion: new epoch, reshuffled
+                exhausted += 1
+                self._rebuild(name)
+                if exhausted > 2:  # restarts immediately empty: dead stream
+                    return None
+            except Exception as e:
+                self._rebuild(name)
+                if errors >= len(self.RETRY_DELAYS_S):
+                    print(
+                        f"[mix] stream {name!r} still failing after {errors} retries "
+                        f"({type(e).__name__}: {e}); benching it for {self.COOLDOWN_S:.0f}s",
+                        flush=True,
+                    )
+                    return None
+                delay = self.RETRY_DELAYS_S[errors]
+                errors += 1
+                print(
+                    f"[mix] stream {name!r} error ({type(e).__name__}: {e}); "
+                    f"rebuilding in {delay:.0f}s",
+                    flush=True,
+                )
+                time.sleep(delay)
 
     def __iter__(self) -> Iterator[dict]:
+        cooldown: dict[str, float] = {}
+        misses = 0
         while True:
-            name = self.rng.choices(self.names, weights=self.weights, k=1)[0]
+            now = time.monotonic()
+            avail = [n for n in self.names if cooldown.get(n, 0.0) <= now]
+            avail_w = [self.weights[self.names.index(n)] for n in avail]
+            if not avail or (sum(avail_w) <= 0 and cooldown):
+                time.sleep(max(min(cooldown.values()) - now, 1.0))
+                continue
+            name = self.rng.choices(avail, weights=avail_w, k=1)[0]
             ex = self._next_from(name)
             if ex is None:
+                cooldown[name] = time.monotonic() + self.COOLDOWN_S
+                misses += 1
+                if misses >= self.MAX_CONSECUTIVE_MISSES:
+                    raise RuntimeError(
+                        f"data mixture: streams failing repeatedly (last: {name!r}) — "
+                        "check network and dataset availability"
+                    )
                 continue
+            misses = 0
+            cooldown.pop(name, None)
             norm = NORMALIZERS[self.kinds[name]](ex)
             if norm is None:
                 continue

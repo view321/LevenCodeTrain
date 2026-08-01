@@ -1,3 +1,5 @@
+import pytest
+
 from levencode.data.mix import (
     NORMALIZERS,
     WeightedMixer,
@@ -60,6 +62,42 @@ def test_mixer_restarts_exhausted_streams():
     for _ in range(10):
         next(it)
     assert calls["n"] >= 3  # restarted at least twice
+
+
+def test_mixer_survives_transient_stream_errors():
+    entries = [entry("a", "chat", 1.0)]
+    calls = {"n": 0}
+
+    def factory(epoch):
+        calls["n"] += 1
+        if calls["n"] == 2:  # second epoch dies mid-stream, like a network reset
+            def boom():
+                yield CHAT_EX
+                raise ConnectionError("stream reset")
+
+            return boom()
+        return iter([CHAT_EX] * 3)
+
+    mixer = WeightedMixer(entries, {"a": factory}, seed=0)
+    mixer.RETRY_DELAYS_S = (0.0,)  # no sleeping in tests
+    it = iter(mixer)
+    out = [next(it) for _ in range(12)]
+    assert all(o["_source"] == "a" for o in out)
+    assert calls["n"] >= 4  # original + broken epoch + rebuilds after the error
+
+
+def test_mixer_raises_after_persistent_failure():
+    entries = [entry("a", "chat", 1.0)]
+
+    def factory(epoch):
+        raise ConnectionError("no network")
+
+    mixer = WeightedMixer(entries, {"a": factory}, seed=0)
+    mixer.RETRY_DELAYS_S = ()
+    mixer.COOLDOWN_S = 0.0
+    mixer.MAX_CONSECUTIVE_MISSES = 3
+    with pytest.raises(RuntimeError, match="failing repeatedly"):
+        next(iter(mixer))
 
 
 def test_build_mixture_with_fake_streams():

@@ -3,7 +3,11 @@
 Design: plain Python iterators (no DataLoader workers — Windows-safe), fp32
 master weights with bf16 autocast on CUDA, gradient accumulation, cosine LR
 with warmup, JSONL metrics + state.json for the WebUI, generation samples for
-the gallery, and an automatic benchmark run at stage end."""
+the gallery, and an automatic benchmark run at stage end.
+
+Each metrics.jsonl row is averaged over the full window since the previous row
+(log_every steps × grad_accum micro-batches), not a single-step snapshot — the
+per-step 1/t-weighted diffusion loss is far too noisy to read raw."""
 
 from __future__ import annotations
 
@@ -40,6 +44,27 @@ GALLERY_PROMPTS = [
     [{"role": "user", "content": "What is 17 * 24? Think step by step and give the final answer after ####."}],
     [{"role": "user", "content": "Explain in two sentences what a hash map is."}],
 ]
+
+
+class MetricAcc:
+    """Sum/count accumulator for scalar training metrics.
+
+    Each key is averaged over the number of times it was actually added, so
+    per-branch metrics stay correctly scaled at any edit/SFT mix — `ce` is only
+    added on retained-SFT micro-batches, `del_recall` only when a batch
+    contains junk, etc. A plain sum divided by the global micro-batch count
+    under-reports every conditional key (the bug this replaces)."""
+
+    def __init__(self) -> None:
+        self._sum: dict[str, float] = {}
+        self._count: dict[str, int] = {}
+
+    def add(self, key: str, value: float) -> None:
+        self._sum[key] = self._sum.get(key, 0.0) + float(value)
+        self._count[key] = self._count.get(key, 0) + 1
+
+    def means(self) -> dict[str, float]:
+        return {k: self._sum[k] / self._count[k] for k in self._sum}
 
 
 class Trainer:
@@ -187,7 +212,7 @@ class Trainer:
     def backbone_lm_head(self):
         return self.editor.backbone.lm_head
 
-    def _sft_step(self, batch: dict, metrics: dict) -> float:
+    def _sft_step(self, batch: dict, metrics: MetricAcc) -> float:
         with self.autocast:
             h = self.editor.hidden(batch["input_ids"], batch["attention_mask"])
             logits_sel, labels_sel, b_idx = self._gathered_logits(h, batch["labels"])
@@ -198,13 +223,13 @@ class Trainer:
             if self.with_jepa:
                 jl = self._jepa_term(h, batch["input_ids"], batch["labels"], batch["attention_mask"])
                 total = total + float(self.loss_w.get("jepa", 0.0)) * jl
-                metrics["jepa_loss"] = metrics.get("jepa_loss", 0.0) + jl.item()
+                metrics.add("jepa_loss", jl.item())
         (total / self.grad_accum).backward()
-        metrics["fill_loss"] = metrics.get("fill_loss", 0.0) + loss_fill.item()
-        metrics["ce"] = metrics.get("ce", 0.0) + ce.item()
+        metrics.add("fill_loss", loss_fill.item())
+        metrics.add("ce", ce.item())
         return total.item()
 
-    def _edit_step(self, batch: dict, metrics: dict) -> float:
+    def _edit_step(self, batch: dict, metrics: MetricAcc) -> float:
         d, i, f = batch["del"], batch["ins"], batch["fill"]
         total_display = 0.0
 
@@ -221,7 +246,7 @@ class Trainer:
             junk = d["labels"] == 1
             if junk.any():
                 hit = (torch.sigmoid(d_logits.float()) > 0.5) & junk
-                metrics["del_recall"] = metrics.get("del_recall", 0.0) + (hit.sum() / junk.sum()).item()
+                metrics.add("del_recall", (hit.sum() / junk.sum()).item())
 
         with self.autocast:
             h_i = self.editor.hidden(i["input_ids"], i["attention_mask"])
@@ -237,7 +262,7 @@ class Trainer:
             nz = (lab != IGNORE) & (lab > 0)
             if nz.any():
                 hit = (i_logits.argmax(-1) > 0) & nz
-                metrics["ins_nonzero_recall"] = metrics.get("ins_nonzero_recall", 0.0) + (hit.sum() / nz.sum()).item()
+                metrics.add("ins_nonzero_recall", (hit.sum() / nz.sum()).item())
 
         with self.autocast:
             h_f = self.editor.hidden(f["input_ids"], f["attention_mask"])
@@ -247,16 +272,16 @@ class Trainer:
             if self.with_jepa:
                 jl = self._jepa_term(h_f, f["input_ids"], f["labels"], f["attention_mask"])
                 scaled = scaled + float(self.loss_w.get("jepa", 0.0)) * jl
-                metrics["jepa_loss"] = metrics.get("jepa_loss", 0.0) + jl.item()
+                metrics.add("jepa_loss", jl.item())
         (scaled / self.grad_accum).backward()
         total_display += scaled.item()
 
-        metrics["del_loss"] = metrics.get("del_loss", 0.0) + dl.item()
-        metrics["del_acc"] = metrics.get("del_acc", 0.0) + dacc.item()
-        metrics["ins_loss"] = metrics.get("ins_loss", 0.0) + il.item()
-        metrics["ins_acc"] = metrics.get("ins_acc", 0.0) + iacc.item()
-        metrics["fill_view_loss"] = metrics.get("fill_view_loss", 0.0) + fl.item()
-        metrics["fill_view_acc"] = metrics.get("fill_view_acc", 0.0) + facc.item()
+        metrics.add("del_loss", dl.item())
+        metrics.add("del_acc", dacc.item())
+        metrics.add("ins_loss", il.item())
+        metrics.add("ins_acc", iacc.item())
+        metrics.add("fill_view_loss", fl.item())
+        metrics.add("fill_view_acc", facc.item())
         return total_display
 
     # ---------- main loop ----------
@@ -267,6 +292,7 @@ class Trainer:
         tokens_seen = 0
         window_tokens = 0
         window_t0 = time.perf_counter()
+        window = MetricAcc()  # accumulates across all steps since the last log
 
         try:
             for step in range(1, self.total_steps + 1):
@@ -275,8 +301,7 @@ class Trainer:
                     g["lr"] = lr
                 self.opt.zero_grad(set_to_none=True)
 
-                metrics: dict = {}
-                accum_loss = 0.0
+                step_loss = 0.0
                 n_edit = 0
                 for _ in range(self.grad_accum):
                     use_edit = self.stage in ("edit", "jepa") and self.rng.random() > self.retain_frac
@@ -286,16 +311,16 @@ class Trainer:
                             self.device,
                         )
                         n_edit += 1
-                        loss_val = self._edit_step(batch, metrics)
+                        loss_val = self._edit_step(batch, window)
                         n_tok = sum(v["input_ids"].numel() for v in batch.values())
                     else:
                         batch = self._to(
                             self._next_batch(self.sft_collator, self.sft_stream(), self.micro_bs),
                             self.device,
                         )
-                        loss_val = self._sft_step(batch, metrics)
+                        loss_val = self._sft_step(batch, window)
                         n_tok = batch["input_ids"].numel()
-                    accum_loss += loss_val / self.grad_accum
+                    step_loss += loss_val / self.grad_accum
                     tokens_seen += n_tok
                     window_tokens += n_tok
 
@@ -303,6 +328,8 @@ class Trainer:
                     [p for p in self.editor.parameters() if p.requires_grad], self.grad_clip
                 )
                 self.opt.step()
+                window.add("loss", step_loss)
+                window.add("edit_frac", n_edit / self.grad_accum)
 
                 if self.with_jepa:
                     m = ema_momentum(
@@ -316,11 +343,8 @@ class Trainer:
                     dt = time.perf_counter() - window_t0
                     tok_s = window_tokens / max(dt, 1e-9)
                     window_tokens, window_t0 = 0, time.perf_counter()
-                    n_micro = self.grad_accum
-                    logged = {k: v / max(n_micro if not k.startswith(("del", "ins", "fill_view")) else max(n_edit, 1), 1)
-                              for k, v in metrics.items()}
-                    logged["loss"] = accum_loss
-                    logged["edit_frac"] = n_edit / self.grad_accum
+                    logged = window.means()
+                    window = MetricAcc()
                     logged["tokens_seen"] = tokens_seen
                     self.run.progress(step, logged, lr=lr, tok_per_sec=tok_s)
 

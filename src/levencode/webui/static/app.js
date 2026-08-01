@@ -34,6 +34,7 @@ const state = {
   exp: null,
   focus: null,
   logY: false,
+  smooth: true,
   hidden: { loss: new Set(), comp: new Set() },
   asTable: { loss: false, comp: false, speed: false },
   metrics: {}, // stage -> rows
@@ -173,6 +174,7 @@ function renderTiles() {
     ["progress", `${fmtK(st.step || 0)}<span class="unit">/ ${fmtK(st.total_steps || 0)}</span>`, `${(st.pct || 0).toFixed(1)}%`],
     ["eta", fmtDur(st.eta_s), ""],
     ["loss", st.last && st.last.loss != null ? fmtVal(st.last.loss) : "—", ""],
+    ["masked CE", st.last && st.last.ce != null ? fmtVal(st.last.ce) : "—", "window avg"],
     ["tokens/sec", fmtK(st.tok_per_sec), ""],
     ["lr", st.lr != null ? st.lr.toExponential(1) : "—", ""],
     ["tokens seen", st.last ? fmtK(st.last.tokens_seen) : "—", ""],
@@ -195,6 +197,48 @@ function downsample(points, n = 700) {
   for (let i = 0; i < n - 1; i++) out.push(points[Math.floor(i * stride)]);
   out.push(points[points.length - 1]);
   return out;
+}
+
+// EMA over logged rows. Rows are already window means (see trainer.py); the
+// EMA on top makes the trend readable through plateau-level noise.
+function emaPoints(points, alpha = 0.8) {
+  const out = [];
+  let s = null;
+  for (const [x, y] of points) {
+    if (y == null || !isFinite(y)) continue;
+    s = s == null ? y : alpha * s + (1 - alpha) * y;
+    out.push([x, s]);
+  }
+  return out;
+}
+
+function slopePer1k(points) {
+  const pts = points.filter((p) => p[1] != null && isFinite(p[1]));
+  if (pts.length < 8) return null;
+  const tail = pts.slice(Math.floor(pts.length * 0.67)); // last third
+  const n = tail.length;
+  const mx = tail.reduce((a, p) => a + p[0], 0) / n;
+  const my = tail.reduce((a, p) => a + p[1], 0) / n;
+  let num = 0, den = 0;
+  for (const p of tail) { num += (p[0] - mx) * (p[1] - my); den += (p[0] - mx) ** 2; }
+  return den > 0 ? (num / den) * 1000 : null;
+}
+
+function trendLabel(points) {
+  const s = slopePer1k(points);
+  if (s == null) return "";
+  if (s < -0.003) return `learning, ${s.toFixed(3)} CE per 1k steps`;
+  if (s > 0.003) return `regressing, +${s.toFixed(3)} CE per 1k steps`;
+  return "flat";
+}
+
+// Bold EMA line over a faint raw ghost, per series.
+function withSmoothing(seriesList) {
+  if (!state.smooth) return seriesList;
+  return seriesList.flatMap((s) => [
+    { ...s, ghost: true },
+    { ...s, points: emaPoints(s.points) },
+  ]);
 }
 
 function lineChart(container, seriesList, { logY = false } = {}) {
@@ -255,7 +299,8 @@ function lineChart(container, seriesList, { logY = false } = {}) {
     const path = document.createElementNS(svgNS, "path");
     path.setAttribute("d", d);
     path.setAttribute("fill", "none");
-    path.setAttribute("stroke-width", "2");
+    path.setAttribute("stroke-width", s.ghost ? "1" : "2");
+    if (s.ghost) path.style.opacity = "0.28";
     path.setAttribute("stroke-linejoin", "round");
     path.style.stroke = s.color;
     svg.appendChild(path);
@@ -282,6 +327,7 @@ function lineChart(container, seriesList, { logY = false } = {}) {
     cross.setAttribute("x1", X(best)); cross.setAttribute("x2", X(best));
     cross.setAttribute("visibility", "visible");
     const rows = visible
+      .filter((s) => !s.ghost)
       .map((s) => {
         const p = s.points.find((q) => q[0] === best);
         return p && p[1] != null
@@ -336,26 +382,33 @@ function legend(el, seriesList, hiddenSet, onToggle) {
   );
 }
 
-function lossSeries() {
+// Headline series: masked-prediction CE — the low-noise "is it learning?"
+// signal, and comparable across sft/edit/jepa (same objective, same data mix).
+// The 1/t-weighted total `loss` is a high-variance ELBO estimator: it bounces
+// ~±0.1 at convergence with zero real change, which reads as "not learning".
+// Stages that never log ce (grpo) fall back to their `loss`.
+function learnSeries() {
   return stagesOf(state.exp)
     .filter((s) => (state.metrics[s.stage] || []).length)
     .map((s) => ({
       name: s.stage,
       color: seriesColor(STAGE_SLOT[s.stage] || 8),
-      points: (state.metrics[s.stage] || []).map((r) => [r.step, r.loss]),
+      points: (state.metrics[s.stage] || []).map((r) => [r.step, r.ce != null ? r.ce : r.loss]),
     }));
 }
 
 function renderLossChart() {
-  const all = lossSeries();
-  $("#loss-sub").textContent = "total, by stage";
+  const all = learnSeries();
+  const focused = all.find((s) => s.name === state.focus);
+  const trend = focused ? trendLabel(emaPoints(focused.points)) : "";
+  $("#loss-sub").textContent = `masked CE by stage${trend ? ` — ${state.focus}: ${trend}` : ""}`;
   legend($("#loss-legend"), all, state.hidden.loss, (n) => {
     state.hidden.loss.has(n) ? state.hidden.loss.delete(n) : state.hidden.loss.add(n);
     renderLossChart();
   });
   const shown = all.filter((s) => !state.hidden.loss.has(s.name));
   const el = $("#loss-chart");
-  state.asTable.loss ? dataTable(el, shown) : lineChart(el, shown, { logY: state.logY });
+  state.asTable.loss ? dataTable(el, shown) : lineChart(el, withSmoothing(shown), { logY: state.logY });
 }
 
 function renderCompChart() {
@@ -374,7 +427,7 @@ function renderCompChart() {
   });
   const shown = series.filter((s) => !state.hidden.comp.has(s.name));
   const el = $("#comp-chart");
-  state.asTable.comp ? dataTable(el, shown) : lineChart(el, shown, {});
+  state.asTable.comp ? dataTable(el, shown) : lineChart(el, withSmoothing(shown), {});
 }
 
 function renderSpeedChart() {
@@ -473,6 +526,12 @@ $("#logy-btn").addEventListener("click", () => {
   state.logY = !state.logY;
   $("#logy-btn").setAttribute("aria-pressed", state.logY);
   renderLossChart();
+});
+$("#smooth-btn").addEventListener("click", () => {
+  state.smooth = !state.smooth;
+  $("#smooth-btn").setAttribute("aria-pressed", state.smooth);
+  renderLossChart();
+  renderCompChart();
 });
 document.querySelectorAll(".table-toggle").forEach((b) =>
   b.addEventListener("click", () => {
