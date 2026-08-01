@@ -118,8 +118,9 @@ def main() -> None:
 
         masked = extractor.masked_ids(ids, bundle.mask_id)
         h = extractor.hiddens(masked, device)
-        z_f = extractor.pooled_for_spans(ids, h, fine_spans_rel)
-        z_c = extractor.pooled_for_spans(ids, h, c_spans_abs)
+        z_f = extractor.pooled_for_spans(ids, h, fine_spans_rel).cpu()
+        z_c = extractor.pooled_for_spans(ids, h, c_spans_abs).cpu()
+        del h
         fine_tokens = [ids[s:e] for s, e in fine_spans_rel]
 
         from levencode.latent.teacher import LatentExample

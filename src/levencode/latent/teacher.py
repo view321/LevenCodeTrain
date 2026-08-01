@@ -139,9 +139,9 @@ class PrecomputedLatents:
             nf = len(ex.fine_tokens)
             nc = len(ex.z_coarse)
             if nf:
-                zf[f_off : f_off + nf] = ex.z_fine.numpy().astype("float16")
+                zf[f_off : f_off + nf] = ex.z_fine.detach().float().cpu().numpy().astype("float16")
             if nc:
-                zc[c_off : c_off + nc] = ex.z_coarse.numpy().astype("float16")
+                zc[c_off : c_off + nc] = ex.z_coarse.detach().float().cpu().numpy().astype("float16")
             rows.append(
                 {
                     "ctx_ids": ex.ctx_ids,
