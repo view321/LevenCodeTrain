@@ -239,12 +239,32 @@ def task_gsm8k(ctx: BenchCtx) -> dict:
     return {"gsm8k_em": correct / max(total, 1), "n": total}
 
 
-def repair_code_text(ctx: BenchCtx, code: str, ecfg: EditSamplerCfg) -> str:
-    """Run the trained Levenshtein editor over a code string (draft -> repair)."""
+_ASSERT_NAME_RE = re.compile(r"assert\s+(\w+)\s*\(")
+
+
+def contract_name(test: str) -> str | None:
+    """The function name the test contract calls — must survive repair."""
+    m = _ASSERT_NAME_RE.search(test or "")
+    return m.group(1) if m else None
+
+
+def repair_code_text(
+    ctx: BenchCtx, code: str, ecfg: EditSamplerCfg, protect_names: tuple[str, ...] = ()
+) -> str:
+    """Run the trained Levenshtein editor over a code string (draft -> repair).
+    Tokens of `protect_names` (all BPE variants, with/without leading space)
+    are shielded from the delete head."""
     b = ctx.bundle
+    extra: set[int] = set()
+    for name in protect_names:
+        for variant in (name, " " + name):
+            extra.update(b.encode(variant))
     head = [b.bos_id] if b.bos_id is not None else [b.eos_id]
     ids = head + b.encode(code) + [b.eos_id]
-    out, _trace = repair(ctx.editor.editor_call(), b, ids, ecfg, ctx.device)
+    out, _trace = repair(
+        ctx.editor.editor_call(), b, ids, ecfg, ctx.device,
+        extra_protected=frozenset(extra) or None,
+    )
     return b.decode(out)
 
 
@@ -290,7 +310,8 @@ def task_mbpp(ctx: BenchCtx) -> dict:
         rep_ok = ok
         fixed = None
         if self_repair and not ok:
-            fixed = repair_code_text(ctx, code, ecfg)
+            name = contract_name(tests[0])
+            fixed = repair_code_text(ctx, code, ecfg, protect_names=(name,) if name else ())
             if fixed.strip() and fixed.strip() != code.strip():
                 repair_changed += 1
                 rep_ok, _ = run_python(fixed + test_block, timeout)

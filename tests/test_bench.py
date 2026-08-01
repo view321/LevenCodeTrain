@@ -66,6 +66,41 @@ def test_sandbox_timeout():
     assert not ok and detail == "timeout"
 
 
+def test_contract_name():
+    from levencode.bench.tasks import contract_name
+
+    assert contract_name("assert remove_Occ('hello', 'l') == 'helo'") == "remove_Occ"
+    assert contract_name("assert  find_Volume(10,8,6) == 240") == "find_Volume"
+    assert contract_name("x = 1") is None
+
+
+def test_repair_respects_extra_protected(bundle):
+    import torch
+
+    from levencode.sampling.edit_sampler import EditSamplerCfg, repair
+    from conftest import BOS, EOS, VOCAB
+
+    NAME_TOK, OTHER = 300, 301
+
+    class DeleteEverything:
+        def __call__(self, x):
+            L = x.shape[1]
+            return {
+                "mlm_logits": torch.zeros(1, L, VOCAB),
+                "del_logits": torch.full((1, L), 9.0),
+                "ins_logits": torch.zeros(1, max(L - 1, 0), 9),
+            }
+
+    seq = [BOS, NAME_TOK, OTHER, EOS]
+    out, _ = repair(DeleteEverything(), bundle, seq, EditSamplerCfg(rounds=1))
+    assert out == [BOS, EOS]  # without protection both content tokens die
+    out, _ = repair(
+        DeleteEverything(), bundle, seq, EditSamplerCfg(rounds=1),
+        extra_protected=frozenset({NAME_TOK}),
+    )
+    assert out == [BOS, NAME_TOK, EOS]
+
+
 @pytest.mark.network
 def test_pll_scorer_on_tiny_model(bundle):
     from levencode.bench.tasks import BenchCtx, pll_choice_logprob

@@ -71,9 +71,14 @@ def repair(
     ids: Sequence[int],
     cfg: EditSamplerCfg,
     device: torch.device | str = "cpu",
+    extra_protected: frozenset[int] | None = None,
 ) -> tuple[list[int], EditTrace]:
+    """`extra_protected`: additional token ids the delete head may never remove
+    — e.g. a test-contract function name during draft self-repair. Coarse
+    (id-level, not position-level), but deleting such tokens anywhere is almost
+    always contract-breaking."""
     seq = list(ids)
-    protected = bundle.protected
+    protected = bundle.protected | (extra_protected or frozenset())
     total_del = total_ins = 0
     rounds_used = 0
     # A repair should stay near the input's length; without this, untrained or
