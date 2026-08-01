@@ -302,6 +302,9 @@ def task_repair(ctx: BenchCtx) -> dict:
     ccfg = CorruptionCfg.from_dict(ctx.cfg.get("corruption", {}))
     ecfg = EditSamplerCfg.from_dict(ctx.cfg.get("edit_sampler", {}))
     head = [b.bos_id] if b.bos_id is not None else [b.eos_id]
+    # The oracle variant is independent of sampler knobs; sweeps disable it
+    # after measuring it once (bench.repair_oracle: false).
+    with_oracle = bool(ctx.bench("repair_oracle", True))
     exact = valid = noop = oracle_exact = oracle_valid = 0
     reductions: list[float] = []
     len_ratios: list[float] = []
@@ -324,23 +327,24 @@ def task_repair(ctx: BenchCtx) -> dict:
         deleted += trace.deleted
         inserted += trace.inserted
 
-        # oracle: kept tokens + the true number of masks at each gap; the model
-        # only has to FILL. Upper-bounds what perfect localization would yield.
-        kept = c.kept_sequence()
-        gaps = c.gap_counts()
-        oracle_in: list[int] = []
-        for j, tok in enumerate(kept):
-            oracle_in.append(tok)
-            if j < len(gaps):
-                oracle_in.extend([b.mask_id] * gaps[j])
-        filled = fill_span(ctx, oracle_in, steps=int(ecfg.fill_steps))
-        oracle_exact += int(filled == clean)
-        oracle_valid += int(syntax_ok(b.decode(filled)))
+        if with_oracle:
+            # oracle: kept tokens + the true number of masks at each gap; the
+            # model only has to FILL. Upper-bounds perfect localization.
+            kept = c.kept_sequence()
+            gaps = c.gap_counts()
+            oracle_in: list[int] = []
+            for j, tok in enumerate(kept):
+                oracle_in.append(tok)
+                if j < len(gaps):
+                    oracle_in.extend([b.mask_id] * gaps[j])
+            filled = fill_span(ctx, oracle_in, steps=int(ecfg.fill_steps))
+            oracle_exact += int(filled == clean)
+            oracle_valid += int(syntax_ok(b.decode(filled)))
         total += 1
 
     if total == 0:
         return {"error": "no corrupted samples generated"}
-    return {
+    out = {
         "repair_exact": exact / total,
         "repair_syntax_valid": valid / total,
         "repair_lev_reduction": sum(reductions) / total,
@@ -348,10 +352,12 @@ def task_repair(ctx: BenchCtx) -> dict:
         "repair_len_ratio": sum(len_ratios) / total,
         "repair_mean_deleted": deleted / total,
         "repair_mean_inserted": inserted / total,
-        "repair_oracle_exact": oracle_exact / total,
-        "repair_oracle_syntax_valid": oracle_valid / total,
         "n": total,
     }
+    if with_oracle:
+        out["repair_oracle_exact"] = oracle_exact / total
+        out["repair_oracle_syntax_valid"] = oracle_valid / total
+    return out
 
 
 def task_infill(ctx: BenchCtx) -> dict:
