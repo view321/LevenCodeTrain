@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import torch
 
 from levencode.bench.benchmark import run_benchmark
-from levencode.config import cfg_get, load_config
+from levencode.config import apply_overrides, cfg_get, load_config
 from levencode.model.backbone import load_tokenizer_bundle
 from levencode.model.editor import build_editor
 from levencode.train.state import RunDir
@@ -30,9 +30,14 @@ def main() -> None:
     ap.add_argument("--name", required=True, help="result name, becomes bench/<name>.json")
     ap.add_argument("--only", nargs="*", default=None, help="subset of tasks to run")
     ap.add_argument("--device", default=None)
+    ap.add_argument(
+        "--set", nargs="*", default=[], metavar="KEY=VALUE",
+        help="config overrides, e.g. --set bench.mbpp_n=257 bench.gsm8k_n=300",
+    )
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    apply_overrides(cfg, args.set)
     if args.device:
         cfg.setdefault("run", {})["device"] = args.device
     device = resolve_device(cfg_get(cfg, "run.device", "auto"))

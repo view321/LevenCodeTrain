@@ -29,6 +29,22 @@ def test_cfg_get():
         pass
 
 
+def test_apply_overrides():
+    from levencode.config import apply_overrides
+
+    cfg = {"bench": {"mbpp_n": 50}}
+    apply_overrides(cfg, ["bench.mbpp_n=257", "bench.new_flag=true", "run.lr=2.5e-5", "run.name=big"])
+    assert cfg["bench"]["mbpp_n"] == 257
+    assert cfg["bench"]["new_flag"] is True
+    assert cfg["run"]["lr"] == 2.5e-5
+    assert cfg["run"]["name"] == "big"
+    try:
+        apply_overrides(cfg, ["no_equals_sign"])
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
 def test_real_stage_configs_parse():
     from pathlib import Path
 
