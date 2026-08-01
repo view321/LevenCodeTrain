@@ -1,0 +1,11 @@
+# Stage 1: pretrain the looped MoE on ~5B tokens (fineweb-edu + code + math).
+# Concepts are structurally off (zero-init FiLM) — nothing concept-related
+# trains here. 76,000 steps x 65,536 tok/step ~ 5.0B tokens.
+
+_extends: loom_base.yaml
+
+stage: pretrain
+
+train:
+  total_steps: 76000
+  warmup_steps: 2000

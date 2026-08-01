@@ -46,11 +46,20 @@ def _norm_code_raw(ex: dict) -> dict | None:
     return {"text": txt}
 
 
+def _norm_text_raw(ex: dict) -> dict | None:
+    """Plain-text pretrain documents (fineweb-edu, finemath, ...)."""
+    txt = ex.get("text") or ex.get("content") or ""
+    if len(txt) < 200:
+        return None
+    return {"text": txt[:200_000]}
+
+
 NORMALIZERS: dict[str, Normalizer] = {
     "chat": _norm_chat,
     "magicoder": _norm_magicoder,
     "metamath": _norm_metamath,
     "code_raw": _norm_code_raw,
+    "text_raw": _norm_text_raw,
 }
 
 

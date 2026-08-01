@@ -1,0 +1,14 @@
+# Stage 2: concept phase. EMA copy provides pooled-hidden targets; the
+# predictor trains by regression, trunk+FiLM train by CE conditioned on the
+# predictor's own detached plans. ~260M tokens.
+
+_extends: loom_base.yaml
+
+stage: concept
+init_from: runs/loom/pretrain/ckpt/final
+
+train:
+  total_steps: 4000
+  warmup_steps: 200
+  lr_muon: 0.005
+  lr_adamw: 1.0e-4

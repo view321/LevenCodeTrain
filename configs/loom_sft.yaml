@@ -1,0 +1,14 @@
+# Stage 3: SFT on the instruct mix (answers supervised, prompts masked).
+# ~7,600 steps ~ 0.5B tokens => 5.5B total, matching the MoE baseline budget.
+
+_extends: loom_base.yaml
+
+stage: sft
+init_from: runs/loom/concept/ckpt/final
+
+train:
+  total_steps: 7600
+  warmup_steps: 300
+  lr_muon: 0.005
+  lr_adamw: 1.0e-4
+  sample_every: 250

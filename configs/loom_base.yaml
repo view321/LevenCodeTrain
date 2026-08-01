@@ -1,0 +1,107 @@
+# Loom shared config: looped-MoE decoder + concept guidance (src/loom).
+# Stages extend this: loom_pretrain -> loom_concept -> loom_sft.
+# Sizing: 293.7M total / 263.2M active-equivalent per token; ~65,536 tok/step
+# at the train defaults => 5B tokens ~ 76k steps ~ 24-30h on the 5090.
+
+run:
+  experiment: loom
+  device: auto
+  seed: 1337
+  dir: runs
+
+model:
+  # tokenizer only — Loom trains from scratch on the shared LFM2 vocab so
+  # levencode's bundle, bench prompts, and chat template carry over
+  tokenizer_repo: LiquidAI/LFM2.5-Encoder-350M-Diffusion
+  max_seq_len: 1024
+
+loom:
+  d_model: 1024
+  n_heads: 16
+  n_kv_heads: 4
+  prelude_layers: 2
+  core_layers: 4
+  coda_layers: 2
+  n_loops: 3
+  d_ff_dense: 2816
+  n_experts: 8
+  top_k: 2
+  d_ff_expert: 1024
+  shared_expert: true
+  segment_len: 32
+  concept_layers: 4
+  concept_heads: 8
+  concept_ff: 2816
+  max_seq_len: 4096
+
+data:
+  shuffle_buffer: 10000
+  pretrain_mix:
+    - name: fineweb_edu
+      dataset: HuggingFaceFW/fineweb-edu
+      subset: sample-10BT
+      split: train
+      weight: 0.55
+      kind: text_raw
+    - name: code
+      dataset: codeparrot/codeparrot-clean
+      subset: null
+      split: train
+      weight: 0.25
+      kind: code_raw
+    - name: math
+      dataset: HuggingFaceTB/finemath
+      subset: finemath-4plus
+      split: train
+      weight: 0.20
+      kind: text_raw
+  sft_mix:
+    - name: chat
+      dataset: HuggingFaceTB/smoltalk
+      subset: all
+      split: train
+      weight: 0.50
+      kind: chat
+    - name: code_instruct
+      dataset: ise-uiuc/Magicoder-OSS-Instruct-75K
+      subset: null
+      split: train
+      weight: 0.30
+      kind: magicoder
+    - name: math_instruct
+      dataset: meta-math/MetaMathQA
+      subset: null
+      split: train
+      weight: 0.20
+      kind: metamath
+
+train:
+  micro_batch_size: 16
+  grad_accum: 4
+  lr_muon: 0.02
+  lr_adamw: 3.0e-4
+  muon_momentum: 0.95
+  weight_decay: 0.01
+  warmup_steps: 1000
+  grad_clip: 1.0
+  log_every: 20
+  sample_every: 500
+  ckpt_every: 2000
+  grad_checkpoint: true
+
+concept:
+  ema_momentum: 0.999
+  loss_weight: 1.0
+  freeze_trunk: false
+
+bench:
+  at_stage_end: true
+  heldout_n: 32
+  chat_loss_n: 64
+  arc_n: 200
+  gsm8k_n: 100
+  mbpp_n: 50
+  brierlm_n: 8
+  exec_timeout_s: 5.0
+  # chat_format / use_concepts default by stage (sft -> chat; pretrain -> no
+  # concepts); override with --set bench.use_concepts=false for ablations
