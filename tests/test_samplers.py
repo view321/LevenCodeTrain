@@ -112,6 +112,35 @@ def test_edit_sampler_repairs(bundle):
     assert trace.rounds_used <= 3
 
 
+def test_edit_sampler_ins_zero_penalty(bundle):
+    """A conservatively-tied insert head (class 0 barely winning) inserts
+    nothing by default, but does insert once the zero-penalty is applied."""
+    from conftest import BOS
+
+    class BarelyConservative:
+        def __call__(self, x):
+            L = x.shape[1]
+            ids = x[0]
+            mlm = torch.zeros(1, L, VOCAB)
+            mlm[:, :, C_TOK] = 10.0
+            ins = torch.zeros(1, max(L - 1, 0), 9)
+            ins[:, :, 0] = 1.0   # count-0 wins...
+            ins[:, :, 1] = 0.5   # ...but count-1 is close
+            if MASK in ids.tolist():
+                ins[:, :, 0] = 9.0  # never insert next to pending masks
+            return {"mlm_logits": mlm, "del_logits": torch.full((1, L), -8.0), "ins_logits": ins}
+
+    seq = [BOS, A, B_TOK, EOS]
+    out, trace = repair(BarelyConservative(), bundle, seq, EditSamplerCfg(rounds=1))
+    assert trace.inserted == 0 and out == seq
+
+    out, trace = repair(
+        BarelyConservative(), bundle, seq, EditSamplerCfg(rounds=1, ins_zero_penalty=1.0)
+    )
+    assert trace.inserted > 0
+    assert C_TOK in out  # inserted masks were filled
+
+
 def test_edit_sampler_never_deletes_protected(bundle):
     from conftest import BOS
 

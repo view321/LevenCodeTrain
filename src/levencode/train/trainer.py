@@ -210,17 +210,34 @@ class Trainer:
 
         with self.autocast:
             h_d = self.editor.hidden(d["input_ids"], d["attention_mask"])
-            dl, dacc = delete_loss(self.editor.heads.delete_logits(h_d), d["labels"])
+            d_logits = self.editor.heads.delete_logits(h_d)
+            dl, dacc = delete_loss(
+                d_logits, d["labels"], pos_weight=float(self.loss_w.get("delete_pos_weight", 2.0))
+            )
             scaled = float(self.loss_w.get("delete", 0.5)) * dl
         (scaled / self.grad_accum).backward()
         total_display += scaled.item()
+        with torch.no_grad():  # junk recall: the "does it ever delete?" signal
+            junk = d["labels"] == 1
+            if junk.any():
+                hit = (torch.sigmoid(d_logits.float()) > 0.5) & junk
+                metrics["del_recall"] = metrics.get("del_recall", 0.0) + (hit.sum() / junk.sum()).item()
 
         with self.autocast:
             h_i = self.editor.hidden(i["input_ids"], i["attention_mask"])
-            il, iacc = insert_loss(self.editor.heads.insert_logits(h_i), i["labels"])
+            i_logits = self.editor.heads.insert_logits(h_i)
+            il, iacc = insert_loss(
+                i_logits, i["labels"], zero_weight=float(self.loss_w.get("insert_zero_weight", 0.5))
+            )
             scaled = float(self.loss_w.get("insert", 0.5)) * il
         (scaled / self.grad_accum).backward()
         total_display += scaled.item()
+        with torch.no_grad():  # nonzero-gap recall: the "does it ever insert?" signal
+            lab = i["labels"][:, : i_logits.shape[1]]
+            nz = (lab != IGNORE) & (lab > 0)
+            if nz.any():
+                hit = (i_logits.argmax(-1) > 0) & nz
+                metrics["ins_nonzero_recall"] = metrics.get("ins_nonzero_recall", 0.0) + (hit.sum() / nz.sum()).item()
 
         with self.autocast:
             h_f = self.editor.hidden(f["input_ids"], f["attention_mask"])

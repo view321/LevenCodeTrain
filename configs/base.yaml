@@ -76,6 +76,8 @@ train:
     delete: 0.5
     insert: 0.5
     jepa: 0.0
+    delete_pos_weight: 2.0    # junk labels are ~10%; upweight so the head learns to delete
+    insert_zero_weight: 0.5   # count-0 gaps are ~90%; downweight so the head learns to insert
   retain_sft_frac: 0.5       # in edit stages, fraction of batches kept on the SFT objective
 
 jepa:

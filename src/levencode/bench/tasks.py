@@ -74,6 +74,28 @@ def syntax_ok(code: str) -> bool:
         return False
 
 
+_CODE_START_RE = re.compile(r"\s*(def |import |from |class |@)")
+
+
+def salvage_code(text: str) -> str:
+    """Best-effort code extraction from a model answer: fenced block if valid,
+    else from the first code-looking line onward, trimming trailing prose lines
+    until it parses. Small models often answer without fences — without this,
+    MBPP scores the prose and reports a misleading 0."""
+    code = extract_code(text)
+    if syntax_ok(code):
+        return code
+    lines = (text or "").splitlines()
+    starts = [i for i, l in enumerate(lines) if _CODE_START_RE.match(l)]
+    if starts:
+        cand = lines[starts[0]:]
+        for cut in range(0, min(6, len(cand))):
+            trimmed = "\n".join(cand[: len(cand) - cut] if cut else cand)
+            if syntax_ok(trimmed):
+                return trimmed
+    return code
+
+
 # ---------- scoring helpers ----------
 
 @torch.no_grad()
@@ -226,7 +248,9 @@ def task_mbpp(ctx: BenchCtx) -> dict:
     scfg = ctx.sampler_cfg()
     timeout = float(ctx.bench("exec_timeout_s", 5.0))
     passed = 0
+    gen_valid = 0
     total = 0
+    failures: list[dict] = []
     for ex in ds:
         tests = ex["test_list"]
         prompt_ids = ctx.bundle.chat_prompt_ids(
@@ -239,26 +263,49 @@ def task_mbpp(ctx: BenchCtx) -> dict:
             }]
         )
         res = generate(ctx.editor.mlm_call(), ctx.bundle, prompt_ids, scfg, ctx.device)
-        code = extract_code(res.text)
+        code = salvage_code(res.text)
+        gen_valid += int(syntax_ok(code))
         program = code + "\n\n" + "\n".join(tests) + "\n"
-        ok, _detail = run_python(program, timeout)
+        ok, detail = run_python(program, timeout)
         passed += int(ok)
         total += 1
-    return {"mbpp_pass1": passed / max(total, 1), "n": total}
+        if not ok and len(failures) < 3:
+            failures.append(
+                {
+                    "prompt": ex["prompt"][:200],
+                    "generated": res.text[:400],
+                    "extracted": code[:400],
+                    "detail": detail,
+                }
+            )
+    return {
+        "mbpp_pass1": passed / max(total, 1),
+        "mbpp_gen_syntax_rate": gen_valid / max(total, 1),
+        "n": total,
+        "failures": failures,
+    }
 
 
 def task_repair(ctx: BenchCtx) -> dict:
     """Corrupt fixture code with known edits; the editor must recover it
-    self-located (no oracle hints). The signature eval for this project."""
+    self-located (no oracle hints). The signature eval for this project.
+
+    Also reports the failure-mode diagnostics that make the headline numbers
+    interpretable: no-op rate (editor did nothing -> lev_reduction ~0), length
+    ratio (runaway insertion -> ratio >> 1, hugely negative lev_reduction —
+    the signature of UNTRAINED heads, i.e. any stage-1 checkpoint), and an
+    oracle variant (true edit locations given, only the fill is the model's) to
+    separate can't-locate from can't-fill."""
     n = int(ctx.bench("repair_n", 40))
     seed = int(ctx.cfg.get("run", {}).get("seed", 1337))
     b = ctx.bundle
     ccfg = CorruptionCfg.from_dict(ctx.cfg.get("corruption", {}))
     ecfg = EditSamplerCfg.from_dict(ctx.cfg.get("edit_sampler", {}))
     head = [b.bos_id] if b.bos_id is not None else [b.eos_id]
-    exact = 0
-    valid = 0
-    reductions = []
+    exact = valid = noop = oracle_exact = oracle_valid = 0
+    reductions: list[float] = []
+    len_ratios: list[float] = []
+    deleted = inserted = 0
     total = 0
     for i, code in enumerate(load_snippets()[:n]):
         rng = random.Random(seed + i)
@@ -267,17 +314,42 @@ def task_repair(ctx: BenchCtx) -> dict:
         c = corrupt(clean, rng, ccfg, junk, protected=b.protected)
         if c.n_junk() + c.n_missing() == 0:
             continue
-        out, _trace = repair(ctx.editor.editor_call(), b, c.corrupted, ecfg, ctx.device)
+
+        out, trace = repair(ctx.editor.editor_call(), b, c.corrupted, ecfg, ctx.device)
         exact += int(out == clean)
         valid += int(syntax_ok(b.decode(out)))
+        noop += int(out == c.corrupted)
         reductions.append(lev_reduction(c.corrupted, out, clean))
+        len_ratios.append(len(out) / max(len(clean), 1))
+        deleted += trace.deleted
+        inserted += trace.inserted
+
+        # oracle: kept tokens + the true number of masks at each gap; the model
+        # only has to FILL. Upper-bounds what perfect localization would yield.
+        kept = c.kept_sequence()
+        gaps = c.gap_counts()
+        oracle_in: list[int] = []
+        for j, tok in enumerate(kept):
+            oracle_in.append(tok)
+            if j < len(gaps):
+                oracle_in.extend([b.mask_id] * gaps[j])
+        filled = fill_span(ctx, oracle_in, steps=int(ecfg.fill_steps))
+        oracle_exact += int(filled == clean)
+        oracle_valid += int(syntax_ok(b.decode(filled)))
         total += 1
+
     if total == 0:
         return {"error": "no corrupted samples generated"}
     return {
         "repair_exact": exact / total,
         "repair_syntax_valid": valid / total,
         "repair_lev_reduction": sum(reductions) / total,
+        "repair_noop_rate": noop / total,
+        "repair_len_ratio": sum(len_ratios) / total,
+        "repair_mean_deleted": deleted / total,
+        "repair_mean_inserted": inserted / total,
+        "repair_oracle_exact": oracle_exact / total,
+        "repair_oracle_syntax_valid": oracle_valid / total,
         "n": total,
     }
 

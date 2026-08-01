@@ -73,6 +73,31 @@ def test_delete_loss_masks_pads():
     assert loss0.item() == 0.0
 
 
+def test_delete_loss_pos_weight():
+    """Upweighting positives must raise the penalty for a missed junk token."""
+    logits = torch.tensor([[-6.0, -6.0, -6.0]])  # predicts "keep" everywhere
+    labels = torch.tensor([[1, 0, 0]])           # first token is junk (missed)
+    base, _ = delete_loss(logits, labels)
+    weighted, _ = delete_loss(logits, labels, pos_weight=4.0)
+    assert weighted.item() > base.item() * 2
+
+
+def test_insert_loss_zero_weight():
+    B, G, C = 1, 3, 5
+    logits = torch.zeros(B, G, C)
+    logits[..., 3] = 2.0  # head leans toward count-3, so per-class CE differs
+    labels_nonzero = torch.tensor([[1, 2, 3]])
+    a, _ = insert_loss(logits, labels_nonzero)
+    b, _ = insert_loss(logits, labels_nonzero, zero_weight=0.5)
+    assert torch.isclose(a, b)  # weight on class 0 is irrelevant if no 0 labels
+
+    labels_mixed = torch.tensor([[0, 0, 3]])
+    full, _ = insert_loss(logits, labels_mixed)
+    down, _ = insert_loss(logits, labels_mixed, zero_weight=0.25)
+    # downweighting the (badly-predicted) zero class must lower the weighted mean
+    assert torch.isfinite(down) and down.item() < full.item()
+
+
 def test_insert_loss_slices_labels():
     B, L, K1 = 1, 5, 4
     ins_logits = torch.zeros(B, L - 1, K1)

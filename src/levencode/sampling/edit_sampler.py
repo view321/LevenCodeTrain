@@ -24,6 +24,9 @@ class EditSamplerCfg:
     temperature: float = 0.0
     top_p: float = 0.9
     max_len: int = 2048
+    # Subtracted from the count-0 logit before the insertion argmax; > 0 makes
+    # the editor less conservative about inserting (counters class imbalance).
+    ins_zero_penalty: float = 0.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "EditSamplerCfg":
@@ -73,6 +76,9 @@ def repair(
     protected = bundle.protected
     total_del = total_ins = 0
     rounds_used = 0
+    # A repair should stay near the input's length; without this, untrained or
+    # miscalibrated insert heads balloon the sequence to cfg.max_len with noise.
+    len_cap = min(cfg.max_len, int(len(seq) * 1.5) + 64)
 
     for _ in range(cfg.rounds):
         rounds_used += 1
@@ -95,15 +101,19 @@ def repair(
         out = editor_call(x)
         n_ins = 0
         if len(seq) >= 2:
-            counts = out["ins_logits"][0].float().argmax(dim=-1).tolist()  # per gap after token i
+            ins_logits = out["ins_logits"][0].float()
+            if cfg.ins_zero_penalty:
+                ins_logits = ins_logits.clone()
+                ins_logits[:, 0] -= cfg.ins_zero_penalty
+            counts = ins_logits.argmax(dim=-1).tolist()  # per gap after token i
             new_seq: list[int] = []
             for i, tok in enumerate(seq):
                 new_seq.append(tok)
-                if i < len(counts) and counts[i] > 0 and len(new_seq) < cfg.max_len:
+                if i < len(counts) and counts[i] > 0 and len(new_seq) < len_cap:
                     n = int(counts[i])
                     new_seq.extend([bundle.mask_id] * n)
                     n_ins += n
-            seq = new_seq[: cfg.max_len]
+            seq = new_seq[:len_cap]
         total_ins += n_ins
 
         # 3) fill pass

@@ -21,8 +21,10 @@ const BENCH_METRICS = [
   { label: "GSM8K EM", task: "gsm8k", key: "gsm8k_em", dir: "up", fmt: pct },
   { label: "MBPP pass@1", task: "mbpp", key: "mbpp_pass1", dir: "up", fmt: pct },
   { label: "repair exact", task: "repair", key: "repair_exact", dir: "up", fmt: pct },
+  { label: "repair oracle exact", task: "repair", key: "repair_oracle_exact", dir: "up", fmt: pct },
   { label: "repair syntax-valid", task: "repair", key: "repair_syntax_valid", dir: "up", fmt: pct },
   { label: "repair lev-reduction", task: "repair", key: "repair_lev_reduction", dir: "up", fmt: f3 },
+  { label: "repair len-ratio", task: "repair", key: "repair_len_ratio", dir: "down", fmt: f3 },
   { label: "infill exact", task: "infill", key: "infill_exact", dir: "up", fmt: pct },
   { label: "gen speed", task: "speed", key: "gen_tok_per_sec", dir: "up", fmt: f1 },
 ];

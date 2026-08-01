@@ -71,25 +71,45 @@ def masked_ce_loss(logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Te
     return loss, acc.detach()
 
 
-def delete_loss(del_logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """BCE over per-token junk labels. labels [B, L] in {0, 1}, IGNORE for pad."""
+def delete_loss(
+    del_logits: torch.Tensor, labels: torch.Tensor, pos_weight: float | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """BCE over per-token junk labels. labels [B, L] in {0, 1}, IGNORE for pad.
+    `pos_weight` upweights the rare junk class (labels are ~90% "keep", and an
+    unweighted head learns to never delete — a no-op editor)."""
     valid = labels != IGNORE
     if not valid.any():
         return del_logits.sum() * 0.0, torch.zeros((), device=del_logits.device)
     target = labels.clamp_min(0).float()
-    raw = F.binary_cross_entropy_with_logits(del_logits.float(), target, reduction="none")
+    pw = None
+    if pos_weight is not None and pos_weight != 1.0:
+        pw = torch.tensor(float(pos_weight), device=del_logits.device)
+    raw = F.binary_cross_entropy_with_logits(
+        del_logits.float(), target, reduction="none", pos_weight=pw
+    )
     loss = (raw * valid).sum() / valid.sum()
     pred = (torch.sigmoid(del_logits.float()) > 0.5).long()
     acc = (pred[valid] == labels[valid]).float().mean()
     return loss, acc.detach()
 
 
-def insert_loss(ins_logits: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """CE over per-gap insertion counts. ins_logits [B, G, K+1], labels [B, G]."""
+def insert_loss(
+    ins_logits: torch.Tensor, labels: torch.Tensor, zero_weight: float | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """CE over per-gap insertion counts. ins_logits [B, G, K+1], labels [B, G].
+    `zero_weight` downweights the dominant count-0 class (same imbalance story
+    as the delete head, from the insertion side)."""
     B, G, C = ins_logits.shape
     labels = labels[:, :G]
+    weight = None
+    if zero_weight is not None and zero_weight != 1.0:
+        weight = torch.ones(C, device=ins_logits.device)
+        weight[0] = float(zero_weight)
     loss = F.cross_entropy(
-        ins_logits.reshape(B * G, C).float(), labels.reshape(B * G), ignore_index=IGNORE
+        ins_logits.reshape(B * G, C).float(),
+        labels.reshape(B * G),
+        ignore_index=IGNORE,
+        weight=weight,
     )
     valid = labels != IGNORE
     if valid.any():

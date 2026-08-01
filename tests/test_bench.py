@@ -36,6 +36,23 @@ def test_syntax_ok():
     assert not syntax_ok("def f(:\n    return 1\n")
 
 
+def test_salvage_code():
+    from levencode.bench.tasks import salvage_code
+
+    fenced = "Sure!\n```python\ndef f():\n    return 1\n```\n"
+    assert salvage_code(fenced) == "def f():\n    return 1\n"
+
+    prose = "Here is the solution you asked for.\ndef g(x):\n    return x * 2\nHope that helps!"
+    out = salvage_code(prose)
+    assert out.startswith("def g") and syntax_ok(out)
+
+    trailing = "def h():\n    return 3\nThis works because of reasons."
+    assert syntax_ok(salvage_code(trailing))
+
+    hopeless = "I cannot write code today."
+    assert salvage_code(hopeless) == hopeless  # falls back to raw text
+
+
 def test_sandbox_pass_fail():
     ok, detail = run_python("assert 1 + 1 == 2\n", timeout_s=10.0)
     assert ok, detail
@@ -87,6 +104,9 @@ def test_offline_tasks_run_on_tiny_model(bundle):
     }
     results = run_benchmark(editor, bundle, cfg, torch.device("cpu"), only=["repair", "infill", "speed"])
     assert "repair_exact" in results["repair"], results["repair"]
+    for key in ("repair_oracle_exact", "repair_noop_rate", "repair_len_ratio",
+                "repair_mean_deleted", "repair_mean_inserted"):
+        assert key in results["repair"], results["repair"]
     assert "infill_exact" in results["infill"], results["infill"]
     assert "gen_tok_per_sec" in results["speed"], results["speed"]
     for name in ("repair", "infill", "speed"):
