@@ -135,6 +135,15 @@ class Trainer:
                 raise FileNotFoundError(
                     f"latent store {store_path!r} not found — run scripts/precompute_latents.py first"
                 )
+            # RVQ EMA warm-up on stored teacher latents: the codebooks start as
+            # random unit-sphere directions, and the AR priors/energy heads
+            # would otherwise spend the first few hundred steps chasing a
+            # moving quantization of the (unit-normalized) latent space.
+            warm_n = int(cfg_get(cfg, "latent.rvq_warm_samples", 8192))
+            if warm_n > 0:
+                z = self.store.sample_rows("fine", warm_n, seed=int(cfg_get(cfg, "run.seed", 1337)))
+                stats = self.editor.latent.rvq.warm(z.to(self.device))
+                print(f"[trainer] RVQ warm-up on {z.shape[0]} latents: {stats['warmed']} books initialized")
 
         max_len = int(cfg_get(cfg, "model.max_seq_len", 1024))
         seed = int(cfg_get(cfg, "run.seed", 1337))
@@ -375,7 +384,7 @@ class Trainer:
         att = (batch["ctx_ids"] != self.bundle.pad_id).long()
         with self.autocast:
             h = self.editor.hidden(batch["ctx_ids"], att)
-            out = self.editor.latent.latent_step(batch, h, self.device)
+            out = self.editor.latent.latent_step(batch, h, self.device, ctx_att=att)
         w = self.loss_w
         total = (
             float(w.get("coarse_ce", 1.0)) * out["coarse_ce"]
@@ -552,6 +561,10 @@ class Trainer:
                     if self.editor.latent is not None:
                         scfg = LatentSamplerCfg.from_dict(self.cfg.get("latent_sampler", {}))
                         scfg.stop_texts = ("[/Answer]",)
+                        # Training never touches the teacher: cycle-consistency
+                        # would lazy-load GRM-3.2-Turf onto the GPU mid-run and
+                        # keep it resident. The bench re-enables it from config.
+                        scfg.cycle_consistency = False
                         res = generate_latent(
                             self.editor, self.editor.latent, self.bundle, prompt_ids, scfg, self.device
                         )

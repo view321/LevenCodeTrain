@@ -48,6 +48,9 @@ class LatentSamplerCfg:
     temperature: float = 0.0
     top_p: float = 0.9
     max_coarse_chunks: int = 6
+    code_history: int = 4  # AR prior context in coarse chunks; training never
+    # sees windows longer than latent.coarse_window, so cap the history there
+    # instead of conditioning on untrained sequence lengths
     cycle_consistency: bool = True
     cycle_threshold: float = 0.75
     cycle_retries: int = 2
@@ -215,7 +218,7 @@ def generate_latent(
             txt = bundle.decode(ids[prompt_len:])
             if any(st in txt for st in cfg.stop_texts):
                 break
-        prev_coarse = torch.cat([prev_coarse, codes_c.unsqueeze(0)], dim=1)
+        prev_coarse = torch.cat([prev_coarse, codes_c.unsqueeze(0)], dim=1)[:, -cfg.code_history :]
 
     seconds = time.perf_counter() - t0
     new_ids = [t for t in ids[prompt_len:] if t not in stop_set]

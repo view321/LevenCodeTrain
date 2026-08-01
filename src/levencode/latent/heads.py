@@ -12,7 +12,9 @@ dropout so sampling can use the classifier-free guided combination
 Sequence layout of a level's AR prior (causal transformer):
     [ctx, b1_0, b2_0, b1_1, b2_1, ...]
 Outputs at even positions predict book-1 of the same-index chunk; odd positions
-predict book-2 (RVQ-AR chaining within a chunk, teacher-forced)."""
+predict book-2 (RVQ-AR chaining within a chunk, teacher-forced). A learned
+positional embedding is added to every slot — without it the causal prior is
+order-blind (a bag-of-codes), which is useless for plan *sequences*."""
 
 from __future__ import annotations
 
@@ -26,7 +28,9 @@ from .rvq import RVQ
 
 
 def causal_mask(sz: int, device) -> torch.Tensor:
-    return torch.triu(torch.full((sz, sz), float("-inf"), device=device), diagonal=1)
+    """Bool attention mask (True = attention disallowed), matching the bool
+    src_key_padding_mask so the two can be combined without dtype warnings."""
+    return torch.triu(torch.ones(sz, sz, dtype=torch.bool, device=device), diagonal=1)
 
 
 class SwiGLUBlock(nn.Module):
@@ -57,7 +61,7 @@ class ResidualHead(nn.Module):
         self, cond: torch.Tensor, noise: torch.Tensor, dropped: torch.Tensor | None = None
     ) -> torch.Tensor:
         if dropped is None:
-            c = cond + self.null
+            c = cond
         else:
             c = torch.where(dropped[:, None].bool(), self.null.expand_as(cond), cond)
         c = self.cond_proj(c)  # cond_dim -> hidden so the blocks can use it
@@ -66,9 +70,13 @@ class ResidualHead(nn.Module):
             x = blk(x, c)
         return self.out(x)
 
-    @torch.no_grad()
     def sample(self, cond: torch.Tensor, n: int) -> torch.Tensor:
-        """n candidate residuals from U[-0.5, 0.5] noise (CALM Sec. 3.3.3)."""
+        """n candidate residuals from U[-0.5, 0.5] noise (CALM Sec. 3.3.3).
+
+        NOT no_grad: the training path differentiates the energy/MSE losses
+        through these samples into the head's weights (the gradient signal that
+        trains the continuous residual). Inference call sites sit under their
+        own torch.no_grad()."""
         B = cond.shape[0]
         d = self.noise_proj.in_features
         eps = torch.rand(B, n, d, device=cond.device) - 0.5
@@ -95,8 +103,11 @@ class EnergyScorer(nn.Module):
     def forward(
         self, cond: torch.Tensor, z: torch.Tensor, dropped: torch.Tensor | None = None
     ) -> torch.Tensor:
+        # dropped=None means "use the condition as-is" (the conditional branch
+        # at train AND inference time); only explicitly dropped rows see the
+        # learned null condition (the CFG unconditional branch).
         if dropped is None:
-            c = cond + self.null
+            c = cond
         else:
             c = torch.where(dropped[:, None].bool(), self.null.expand_as(cond), cond)
         return self.mlp(torch.cat([c, z], dim=-1)).squeeze(-1)
@@ -115,10 +126,12 @@ class LevelHeads(nn.Module):
         ar_heads: int = 8,
         residual_blocks: int = 3,
         energy_hidden: int = 256,
+        max_positions: int = 512,
     ):
         super().__init__()
         self.name = name
         self.code_embed = nn.Embedding(codebook_size, ar_dim)
+        self.pos_embed = nn.Embedding(max_positions, ar_dim)
         layer = nn.TransformerEncoderLayer(
             d_model=ar_dim,
             nhead=ar_heads,
@@ -146,16 +159,22 @@ class LevelHeads(nn.Module):
         emb = self.code_embed(codes)  # [B, T, 2, D]
         seq = torch.cat([head.unsqueeze(1), emb.reshape(B, 2 * T, -1)], dim=1)
         L = 1 + 2 * T
+        pos = torch.arange(L, device=head.device).clamp_max_(self.pos_embed.num_embeddings - 1)
+        seq = seq + self.pos_embed(pos).unsqueeze(0)
         att = causal_mask(L, head.device)
-        pad = torch.zeros(B, L, device=head.device)
         # positions beyond the real chunks are masked; head position is always real
         chunk_flags = mask.unsqueeze(2).expand(B, T, 2).reshape(B, 2 * T)
-        pad[:, 1:] = (chunk_flags == 0).float()
-        out = self.prior(seq, mask=att, src_key_padding_mask=pad.bool())
+        pad = torch.ones(B, L, dtype=torch.bool, device=head.device)
+        pad[:, 0] = False
+        pad[:, 1:] = chunk_flags == 0
+        out = self.prior(seq, mask=att, src_key_padding_mask=pad)
         # even positions 0,2,.. predict book-1 of chunk j; odd positions predict book-2
-        b1_logits = self.b1_head(out[:, 0::2]) + self.bias_b1  # [B, T, C]
+        b1_logits = self.b1_head(out[:, 0::2]) + self.bias_b1  # [B, T+1, C]
         b2_logits = self.b2_head(out[:, 1::2]) + self.bias_b2  # [B, T, C]
-        conds = out[:, 1::2]  # hidden after each chunk's b2 -> residual/energy cond
+        # conds: hidden AFTER chunk j's b2 (positions 2,4,...) — the residual
+        # r = z - z_q depends on BOTH books, so the energy/residual conditioning
+        # must see the full discrete anchor, not just book-1.
+        conds = out[:, 2::2]  # [B, T, D]
         return {"b1_logits": b1_logits, "b2_logits": b2_logits, "conds": conds, "hidden": out}
 
 

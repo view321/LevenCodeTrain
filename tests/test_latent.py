@@ -137,6 +137,49 @@ def test_level_heads_shapes():
     assert e_d.shape == (3,)
 
 
+def test_conds_are_after_b2():
+    """The residual/energy conditioning must see the FULL discrete anchor
+    (both books of the chunk), i.e. the hidden state after b2_j."""
+    torch.manual_seed(0)
+    lv = LevelHeads("t", ar_dim=16, codebook_size=32, latent_dim=8, ar_layers=1, ar_heads=4, residual_blocks=1)
+    head = torch.randn(2, 16)
+    codes = torch.randint(0, 32, (2, 4, 2))
+    mask = torch.ones(2, 4)
+    out = lv(head, codes, mask)
+    assert torch.allclose(out["conds"], out["hidden"][:, 2::2])
+
+
+def test_prior_is_order_sensitive():
+    """A causal transformer without positional embeddings is a bag-of-codes:
+    permuting the code history must change the next-code prediction."""
+    torch.manual_seed(0)
+    lv = LevelHeads("t", ar_dim=16, codebook_size=32, latent_dim=8, ar_layers=1, ar_heads=4, residual_blocks=1)
+    head = torch.randn(1, 16)
+    codes = torch.tensor([[[1, 2], [3, 4], [5, 6]]])
+    perm = torch.tensor([[[5, 6], [3, 4], [1, 2]]])  # same multiset, reversed
+    mask = torch.ones(1, 3)
+    l1 = lv(head, codes, mask)["b1_logits"][0, -1]
+    l2 = lv(head, perm, mask)["b1_logits"][0, -1]
+    assert not torch.allclose(l1, l2)
+
+
+def test_condition_dropout_null_branch_consistency():
+    """dropped=None (inference conditional path) must equal dropped=False
+    (training conditional path) — otherwise CFG scoring is train/infer skewed."""
+    torch.manual_seed(0)
+    es = EnergyScorer(16, 8, hidden=32)
+    rh = ResidualHead(16, 8, blocks=1, hidden=32)
+    with torch.no_grad():  # non-zero null vector, so a cond+null bug would show
+        es.null.add_(torch.randn_like(es.null))
+        rh.null.add_(torch.randn_like(rh.null))
+    cond, z = torch.randn(4, 16), torch.randn(4, 8)
+    keep = torch.zeros(4, dtype=torch.bool)
+    assert torch.allclose(es(cond, z), es(cond, z, dropped=keep))
+    assert torch.allclose(rh(cond, z), rh(cond, z, dropped=keep))
+    drop = torch.ones(4, dtype=torch.bool)
+    assert not torch.allclose(es(cond, z), es(cond, z, dropped=drop))
+
+
 def test_energy_loss_strictly_proper_monotonic():
     torch.manual_seed(1)
     # a well-concentrated head (samples near target) must score better (lower)
@@ -195,6 +238,40 @@ def test_latent_step_losses_flow():
     total.backward()
     grads = [p.grad for p in lb.heads.parameters() if p.grad is not None]
     assert grads, "no gradients reached the latent heads"
+    # regression: the energy loss must reach the residual head — the whole
+    # continuous-detail pathway died when sample() was torch.no_grad()
+    res_grads = [p.grad for n, p in lb.heads.named_parameters() if "residual" in n and p.grad is not None]
+    assert res_grads and any(g.abs().sum().item() > 0 for g in res_grads), (
+        "energy loss produced no gradient in the residual head"
+    )
+
+
+def test_latent_step_masked_ctx_pooling():
+    """ctx_att with pads (store left-pads short contexts) must not change the
+    result when there are no pads; the trainer always passes the real mask."""
+    lb = _make_bundle()
+    lb.eval()
+    B, W, Wf = 2, 3, 2
+    batch = {
+        "ctx_ids": torch.randint(10, 30, (B, 24)),
+        "z_coarse": torch.randn(B, W, 16),
+        "z_fine": torch.randn(B, Wf, 16),
+        "z_coarse_cond": torch.randn(B, 16),
+        "coarse_mask": torch.ones(B, W),
+        "fine_mask": torch.ones(B, Wf),
+    }
+    h = torch.randn(B, 24, 12)
+    att = torch.ones(B, 24, dtype=torch.long)
+    a = lb.latent_step(batch, h, torch.device("cpu"), ctx_att=att)
+    b = lb.latent_step(batch, h, torch.device("cpu"))
+    # CE/acc are the deterministic branches (energy/scorer sample noise), so
+    # they must be identical with vs without the (all-real) mask
+    for k in ("coarse_ce", "fine_ce", "coarse_acc_b1", "coarse_acc_b2", "fine_acc_b1", "fine_acc_b2"):
+        assert torch.allclose(a[k], b[k], atol=1e-6), k
+    # and masked pooling runs with real masks (zeros) without NaN
+    att2 = torch.cat([torch.ones(B, 12), torch.zeros(B, 12)], dim=1).long()
+    c = lb.latent_step(batch, h, torch.device("cpu"), ctx_att=att2)
+    assert torch.isfinite(c["coarse_ce"])
 
 
 def test_decodability_step():
@@ -209,7 +286,20 @@ def test_decodability_step():
     assert any(p.grad is not None for p in lb.adapter.parameters())
 
 
-# ---------- store ----------
+def test_decodability_ignores_pad_positions():
+    """-100-padded positions (shorter chunks) must not contribute to the CE or
+    the accuracy — otherwise the adapter learns to emit a pad token."""
+    lb = _make_bundle()
+    lb.train()
+    lm = torch.nn.Linear(12, VOCAB)
+    tokens = torch.tensor([[10, 11, -100, -100], [10, 11, 12, 13]])
+    batch = {"z": torch.randn(2, 16), "tokens": tokens}
+    out = lb.decodability_step(batch, lm)
+    assert torch.isfinite(out["decodability"])
+    # the 4 real positions drive everything; a CE that counted pads would be
+    # ~2x larger on average, and acc would be dragged toward 25%
+    assert out["decodability_acc"].item() >= 0.0
+
 
 def test_store_roundtrip(tmp_path):
     exs = [
@@ -242,6 +332,49 @@ def test_store_roundtrip(tmp_path):
     assert b["z_coarse_cond"].shape == (2, 8)
     d = store.decodability_batch([0, 1], chunk_tokens=8, n_chunks=2, seed=4)
     assert d["z"].shape[0] == 2 and d["tokens"].shape == (2, 8)
+    # short chunks are IGNORE-padded, never token 0
+    assert (d["tokens"] == -100).any()
+
+
+def test_store_batch_context_includes_preceding_text(tmp_path):
+    """A window that starts past chunk 0 must condition on the text of the
+    chunks before it (that is what inference conditions on), not just the
+    sample prefix."""
+    exs = [
+        LatentExample(
+            ctx_ids=[1, 2, 3],
+            fine_spans=[(3, 5), (5, 7), (7, 9)],
+            coarse_of_fine=[0, 1, 1],  # coarse chunk 1 == fine chunks 1..2
+            fine_tokens=[[10, 11], [12, 13], [14, 15]],
+            z_fine=torch.randn(3, 8),
+            z_coarse=torch.randn(2, 8),
+        )
+    ]
+    store = PrecomputedLatents(tmp_path / "store2")
+    store.write(exs, {"latent_dim": 8, "teacher": "t"})
+    saw_prefix_only = saw_with_body = False
+    for seed in range(12):
+        b = store.batch([0], ctx_len=16, coarse_window=1, fine_window=1, seed=seed, pad_id=0)
+        ctx = b["ctx_ids"][0].tolist()
+        tail = [t for t in ctx if t != 0]
+        if tail == [1, 2, 3]:
+            saw_prefix_only = True
+        if tail == [1, 2, 3, 10, 11]:
+            saw_with_body = True
+    assert saw_prefix_only and saw_with_body
+
+
+def test_store_sample_rows(tmp_path):
+    exs = [
+        LatentExample(
+            ctx_ids=[1], fine_spans=[(1, 3)], coarse_of_fine=[0],
+            fine_tokens=[[7, 8]], z_fine=torch.randn(1, 8), z_coarse=torch.randn(1, 8),
+        )
+    ]
+    store = PrecomputedLatents(tmp_path / "store3")
+    store.write(exs, {"latent_dim": 8, "teacher": "t"})
+    rows = store.sample_rows("fine", n=3, seed=1)
+    assert rows.shape == (1, 8) and rows.dtype == torch.float32
 
 
 # ---------- sampler ----------

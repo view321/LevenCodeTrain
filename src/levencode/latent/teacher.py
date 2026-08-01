@@ -187,7 +187,11 @@ class PrecomputedLatents:
     def batch(self, idxs: list[int], ctx_len: int, coarse_window: int, fine_window: int, seed: int = 0, pad_id: int = 0):
         """Random contiguous chunk window per sample. The fine window is taken
         from the FIRST coarse chunk of the window only, so every fine chunk in
-        a row shares one conditioning coarse latent (`z_coarse_cond`)."""
+        a row shares one conditioning coarse latent (`z_coarse_cond`).
+
+        The context is the sample prefix PLUS the text of every chunk before
+        the window (reconstructed from the stored fine_tokens) — at inference
+        the AR prior conditions on all committed text, so training must too."""
         import random
 
         rng = random.Random(seed)
@@ -214,7 +218,8 @@ class PrecomputedLatents:
             f_sel = f_idx[:fine_window]
             zc = zc_m[r["c_off"] + c0 : r["c_off"] + c1].astype("float32")
             zf = zf_m[r["f_off"] + f_sel[0] : r["f_off"] + f_sel[0] + len(f_sel)].astype("float32")
-            ctx = r["ctx_ids"][-ctx_len:]
+            body_before = [t for j in range(f_sel[0]) for t in r["fine_tokens"][j]]
+            ctx = (r["ctx_ids"] + body_before)[-ctx_len:]
             if len(ctx) < ctx_len:
                 ctx = [pad_id] * (ctx_len - len(ctx)) + ctx
             coarse_zs.append(zc)
@@ -249,7 +254,10 @@ class PrecomputedLatents:
 
     def decodability_batch(self, idxs: list[int], chunk_tokens: int, n_chunks: int, seed: int = 0):
         """Batches of (teacher latent, chunk tokens) pairs for the decodability
-        adapter: fixed fine-chunk K token windows sampled from the store."""
+        adapter: fixed fine-chunk K token windows sampled from the store.
+        Short chunks are right-padded with IGNORE (-100), which the token-CE
+        decode skips — supervising pad positions would teach the adapter to
+        emit a pad token after every chunk."""
         import random
 
         rng = random.Random(seed)
@@ -262,7 +270,7 @@ class PrecomputedLatents:
                 continue
             j = rng.randrange(r["n_fine"])
             tok = r["fine_tokens"][j]
-            t = tok[:chunk_tokens] + [0] * (chunk_tokens - len(tok))
+            t = tok[:chunk_tokens] + [-100] * (chunk_tokens - len(tok))
             z = zf_m[r["f_off"] + j].astype("float32")
             zs.append(z)
             tss.append(t)
@@ -272,3 +280,12 @@ class PrecomputedLatents:
             "z": torch.tensor(np.stack(zs)),
             "tokens": torch.tensor(tss, dtype=torch.long),
         }
+
+    def sample_rows(self, kind: str, n: int, seed: int = 0) -> torch.Tensor:
+        """Random rows from a latent memmap without materializing the whole
+        store (used for the RVQ EMA warm-up at trainer init)."""
+        m = np.load(self.root / ("z_fine.raw" if kind == "fine" else "z_coarse.raw"), mmap_mode="r")
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(m.shape[0], size=min(n, m.shape[0]), replace=False)
+        idx.sort()
+        return torch.from_numpy(np.asarray(m[idx]).astype("float32"))

@@ -538,7 +538,7 @@ def _latent_teacher_force(
         emb = ctx_embed(ctx_ids)
         if ci % fpc == 0:
             z_c, codes_c = latent.predict_coarse_latent(emb, prev_coarse, cfg.__dict__)
-            prev_coarse = torch.cat([prev_coarse, codes_c.unsqueeze(0)], dim=1)
+            prev_coarse = torch.cat([prev_coarse, codes_c.unsqueeze(0)], dim=1)[:, -cfg.code_history :]
             prev_fine = torch.zeros(1, 0, 2, dtype=torch.long, device=ctx.device)
         z_f, codes_f = latent.predict_fine_latent(emb, codes_c, prev_fine, cfg.__dict__)
         plan_logits.append(_plan_logits(latent, ctx.editor, z_f, k, ctx.device))
@@ -547,6 +547,7 @@ def _latent_teacher_force(
     return plan_logits
 
 
+@torch.no_grad()
 def task_brierlm(ctx: BenchCtx) -> dict:
     """BrierLM (CALM Sec. 4): likelihood-free, sample-based LM metric. For each
     fixture context we teacher-force the gold continuation through the model

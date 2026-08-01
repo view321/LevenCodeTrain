@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from .adapter import DecodabilityAdapter
 from .heads import LatentHeads
-from .losses import code_ce_loss, energy_loss, scorer_loss
+from .losses import IGNORE, code_ce_loss, energy_loss, neg_hinge, scorer_loss
 from .rvq import RVQ
 
 
@@ -100,24 +100,38 @@ class LatentBundle(nn.Module):
         m = mask.reshape(B * T).bool()
         zf = z.reshape(B * T, D)
         zq, codes, stats = self.rvq.quantize(zf[m], update=True)
-        codes_full = torch.zeros(B * T, 2, dtype=codes.dtype, device=codes.device)
+        R = codes.shape[-1]
+        codes_full = torch.zeros(B * T, R, dtype=codes.dtype, device=codes.device)
         codes_full[m] = codes
-        codes = codes_full.reshape(B, T, 2)
+        codes = codes_full.reshape(B, T, R)
         out = level(head, codes, mask)
         ce, acc1, acc2 = code_ce_loss(out["b1_logits"], out["b2_logits"], codes, mask)
         r = (zf[m] - zq)  # residual only over real rows
         conds = out["conds"].reshape(B * T, -1)[m]
         n = self.residual_n
-        samples = level.residual.sample(conds, n)  # [K, n, D]
+        samples = level.residual.sample(conds, n)  # [K, n, D] — grad-carrying
         sigma = self.residual_sigma * max(r.norm(dim=-1).mean().item(), 1e-3)
         tgt = r.unsqueeze(1) + sigma * torch.randn(len(r), self.residual_m, D, device=z.device)
         en = energy_loss(samples, tgt)
         mse = (samples.mean(1) - r).pow(2).mean()
+        # CFG-trained scorer: the RANKING hinge only applies to rows whose
+        # condition survived dropout — a dropped row has no (cond, z) pairing to
+        # rank. Dropped rows instead calibrate the unconditional (null) branch:
+        # real latents stay plausible under it (neg_hinge), so at sampling time
+        # E(null, .) is ~flat across candidates and the guided score
+        # (1+w)*E(cond,z) - w*E(null,z) reduces to the conditional ranking.
         drop = torch.rand(len(r), device=z.device) < self.cfg_dropout
-        e_pos = level.energy(conds, zf[m].detach(), dropped=drop)
+        zp = zf[m].detach()
+        e_pos = level.energy(conds, zp, dropped=drop)
         perm = torch.randperm(len(r), device=z.device)
-        e_neg = level.energy(conds, zf[m].detach()[perm], dropped=drop)
-        sc = scorer_loss(e_pos, e_neg, margin=self.scorer_margin)
+        e_neg = level.energy(conds, zp[perm], dropped=drop)
+        keep = ~drop
+        sc_terms = []
+        if keep.any():
+            sc_terms.append(scorer_loss(e_pos[keep], e_neg[keep], margin=self.scorer_margin))
+        if drop.any():
+            sc_terms.append(neg_hinge(e_pos[drop]))
+        sc = torch.stack(sc_terms).mean() if sc_terms else e_pos.sum() * 0.0
         return {
             "ce": ce,
             "acc1": acc1,
@@ -131,9 +145,21 @@ class LatentBundle(nn.Module):
             "codes": codes,
         }
 
-    def latent_step(self, batch: dict, ctx_hidden: torch.Tensor, device: torch.device) -> dict:
-        """ctx_hidden: student encoder hiddens over the batch ctx ids [B, L, H]."""
-        pooled = ctx_hidden.mean(dim=1)
+    def latent_step(
+        self,
+        batch: dict,
+        ctx_hidden: torch.Tensor,
+        device: torch.device,
+        ctx_att: torch.Tensor | None = None,
+    ) -> dict:
+        """ctx_hidden: student encoder hiddens over the batch ctx ids [B, L, H].
+        ctx_att: 1=real token (the store left-pads short contexts; an unmasked
+        mean would let pad embeddings dominate the pooled context)."""
+        if ctx_att is None:
+            pooled = ctx_hidden.mean(dim=1)
+        else:
+            a = ctx_att.unsqueeze(-1).to(ctx_hidden.dtype)
+            pooled = (ctx_hidden * a).sum(dim=1) / a.sum(dim=1).clamp_min(1.0)
         ctx_embed = self.heads.ctx_embed(pooled)
 
         # coarse level: one AR sequence per sample over a window of chunks
@@ -170,14 +196,22 @@ class LatentBundle(nn.Module):
 
     def decodability_step(self, batch: dict, lm_head: nn.Module) -> dict:
         z = batch["z"]  # [B, D]
-        tokens = batch["tokens"]  # [B, max_chunk]
+        tokens = batch["tokens"]  # [B, <=max_chunk], IGNORE-padded to the right
+        if tokens.shape[1] < self.adapter.max_chunk:
+            tokens = F.pad(tokens, (0, self.adapter.max_chunk - tokens.shape[1]), value=IGNORE)
         out = self.adapter(z, reparam=True)
         logits = lm_head(out["logits_hidden"])  # [B, max_chunk, V]
         V = logits.shape[-1]
-        ce = F.cross_entropy(logits.reshape(-1, V).float(), tokens.reshape(-1))
+        valid = tokens != IGNORE
+        n_valid = valid.sum().clamp_min(1)
+        # shorter chunks are -100 padded; supervising those positions would
+        # teach the adapter to always emit a pad token after the chunk ends
+        ce = F.cross_entropy(
+            logits.reshape(-1, V).float(), tokens.reshape(-1), ignore_index=IGNORE, reduction="sum"
+        ) / n_valid
         kl = out["kl"]
         loss = ce + self.kl_beta * kl
-        acc = (logits.argmax(-1) == tokens).float().mean()
+        acc = ((logits.argmax(-1) == tokens) & valid).float().sum() / n_valid
         return {
             "decodability": loss,
             "decodability_ce": ce.detach(),

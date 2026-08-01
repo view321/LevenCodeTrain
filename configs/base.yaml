@@ -137,6 +137,7 @@ latent:
   ctx_len: 192               # student-encoder context tokens per latent batch
   coarse_window: 4           # coarse chunks per latent batch row
   fine_window: 4             # fine chunks per row (within one coarse chunk)
+  rvq_warm_samples: 8192     # stored latents for the RVQ EMA warm-up at trainer init (0 disables)
 
 rollin:
   enabled: false             # roll-in: train edit heads on the model's own outputs
@@ -178,6 +179,7 @@ latent_sampler:
   plan_weight: 1.0           # plan logits mixing into the block filler
   fill_steps: 8
   max_coarse_chunks: 6
+  code_history: 4            # AR prior history in coarse chunks (match latent.coarse_window)
   cycle_consistency: true
   cycle_threshold: 0.75
   cycle_retries: 2
