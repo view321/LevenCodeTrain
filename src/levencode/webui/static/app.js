@@ -20,6 +20,7 @@ const BENCH_METRICS = [
   { label: "ARC-Easy acc", task: "arc_easy", key: "arc_easy_acc", dir: "up", fmt: pct },
   { label: "GSM8K EM", task: "gsm8k", key: "gsm8k_em", dir: "up", fmt: pct },
   { label: "MBPP pass@1", task: "mbpp", key: "mbpp_pass1", dir: "up", fmt: pct },
+  { label: "MBPP pass@1 +self-repair", task: "mbpp", key: "mbpp_pass1_selfrepair", dir: "up", fmt: pct },
   { label: "repair exact", task: "repair", key: "repair_exact", dir: "up", fmt: pct },
   { label: "repair oracle exact", task: "repair", key: "repair_oracle_exact", dir: "up", fmt: pct },
   { label: "repair syntax-valid", task: "repair", key: "repair_syntax_valid", dir: "up", fmt: pct },

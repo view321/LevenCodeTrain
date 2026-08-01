@@ -84,6 +84,21 @@ def test_pll_scorer_on_tiny_model(bundle):
 
 
 @pytest.mark.network
+def test_repair_code_text_on_tiny_model(bundle):
+    from levencode.bench.tasks import BenchCtx, repair_code_text
+    from levencode.model.backbone import tiny_backbone
+    from levencode.model.editor import LevencodeEditor
+    from levencode.sampling.edit_sampler import EditSamplerCfg
+
+    torch.manual_seed(0)
+    editor = LevencodeEditor(tiny_backbone(), insert_max=4)
+    editor.eval()
+    ctx = BenchCtx(editor=editor, bundle=bundle, cfg={}, device=torch.device("cpu"))
+    out = repair_code_text(ctx, "def f():\n    return 1\n", EditSamplerCfg(rounds=1, fill_steps=2))
+    assert isinstance(out, str)  # random tiny weights give garbage, but no crash
+
+
+@pytest.mark.network
 def test_offline_tasks_run_on_tiny_model(bundle):
     """repair / infill / speed must execute end-to-end on the tiny real
     architecture (garbage quality, but exercised mechanics + report shape)."""

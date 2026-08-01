@@ -95,8 +95,11 @@ sampler:
   top_p: 0.9
 
 edit_sampler:
-  rounds: 3
-  delete_threshold: 0.5
+  # Values from the stage-2 knob sweep (scripts/sweep_repair.py, 2026-08):
+  # thr 0.3 / pen 0.0 / rounds 2 lifted self-located repair exact 9% -> 15.6%.
+  rounds: 2
+  delete_threshold: 0.3
+  ins_zero_penalty: 0.0
   fill_steps: 8
 
 bench:

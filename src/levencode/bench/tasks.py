@@ -239,15 +239,33 @@ def task_gsm8k(ctx: BenchCtx) -> dict:
     return {"gsm8k_em": correct / max(total, 1), "n": total}
 
 
+def repair_code_text(ctx: BenchCtx, code: str, ecfg: EditSamplerCfg) -> str:
+    """Run the trained Levenshtein editor over a code string (draft -> repair)."""
+    b = ctx.bundle
+    head = [b.bos_id] if b.bos_id is not None else [b.eos_id]
+    ids = head + b.encode(code) + [b.eos_id]
+    out, _trace = repair(ctx.editor.editor_call(), b, ids, ecfg, ctx.device)
+    return b.decode(out)
+
+
 def task_mbpp(ctx: BenchCtx) -> dict:
+    """MBPP pass@1, plus the draft+repair pipeline: failed generations get one
+    pass through the edit sampler before re-execution. The delta between
+    mbpp_pass1 and mbpp_pass1_selfrepair is the end-to-end value of the editor
+    on the model's OWN mistakes (decohered identifiers, glued tokens) — the
+    product thesis in one number."""
     from datasets import load_dataset
 
     n = int(ctx.bench("mbpp_n", 50))
     ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
     ds = ds.select(range(min(n, len(ds))))
     scfg = ctx.sampler_cfg()
+    ecfg = EditSamplerCfg.from_dict(ctx.cfg.get("edit_sampler", {}))
+    self_repair = bool(ctx.bench("mbpp_self_repair", True))
     timeout = float(ctx.bench("exec_timeout_s", 5.0))
     passed = 0
+    repaired_passed = 0
+    repair_changed = 0
     gen_valid = 0
     total = 0
     failures: list[dict] = []
@@ -265,25 +283,40 @@ def task_mbpp(ctx: BenchCtx) -> dict:
         res = generate(ctx.editor.mlm_call(), ctx.bundle, prompt_ids, scfg, ctx.device)
         code = salvage_code(res.text)
         gen_valid += int(syntax_ok(code))
-        program = code + "\n\n" + "\n".join(tests) + "\n"
-        ok, detail = run_python(program, timeout)
+        test_block = "\n\n" + "\n".join(tests) + "\n"
+        ok, detail = run_python(code + test_block, timeout)
         passed += int(ok)
+
+        rep_ok = ok
+        fixed = None
+        if self_repair and not ok:
+            fixed = repair_code_text(ctx, code, ecfg)
+            if fixed.strip() and fixed.strip() != code.strip():
+                repair_changed += 1
+                rep_ok, _ = run_python(fixed + test_block, timeout)
+        repaired_passed += int(rep_ok)
+
         total += 1
-        if not ok and len(failures) < 3:
-            failures.append(
-                {
-                    "prompt": ex["prompt"][:200],
-                    "generated": res.text[:400],
-                    "extracted": code[:400],
-                    "detail": detail,
-                }
-            )
-    return {
+        if not rep_ok and len(failures) < 3:
+            entry = {
+                "prompt": ex["prompt"][:200],
+                "generated": res.text[:400],
+                "extracted": code[:400],
+                "detail": detail,
+            }
+            if fixed is not None:
+                entry["repaired"] = fixed[:400]
+            failures.append(entry)
+    out = {
         "mbpp_pass1": passed / max(total, 1),
         "mbpp_gen_syntax_rate": gen_valid / max(total, 1),
         "n": total,
         "failures": failures,
     }
+    if self_repair:
+        out["mbpp_pass1_selfrepair"] = repaired_passed / max(total, 1)
+        out["mbpp_repair_changed"] = repair_changed / max(total, 1)
+    return out
 
 
 def task_repair(ctx: BenchCtx) -> dict:
