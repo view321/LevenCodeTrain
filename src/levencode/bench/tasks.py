@@ -506,9 +506,13 @@ def _brierlm_from_scores(
             hits += (1 if x1 == y else 0) + (1 if x2 == y else 0) - (1 if x1 == x2 else 0)
             total += 1
         stats[f"brier_{n}"] = hits / max(total, 1)
+    # Brier-n can go negative (samples collide more than they hit gold — a
+    # confidently-wrong predictor); the geometric mean of an even number of
+    # negatives would sign-flip to a respectable-looking positive score, so
+    # clamp each component at 0: a degenerate predictor scores 0, not 47.
     brierlm = 1.0
     for n in n_grams:
-        brierlm *= stats[f"brier_{n}"]
+        brierlm *= max(stats[f"brier_{n}"], 0.0)
     stats["brierlm"] = 100.0 * (brierlm ** (1.0 / len(n_grams)))
     return stats
 
