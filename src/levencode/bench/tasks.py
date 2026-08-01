@@ -17,6 +17,7 @@ import torch
 from ..data.corruption import CorruptionCfg, corrupt, make_junk_sampler
 from ..data.tokens import TokenizerBundle
 from ..data.mix import extract_code
+from ..latent.sampler import LatentSamplerCfg, generate_latent
 from ..sampling.block_sampler import BlockSamplerCfg, generate
 from ..sampling.edit_sampler import EditSamplerCfg, repair
 from ..util.lev import lev_reduction
@@ -39,6 +40,20 @@ class BenchCtx:
         scfg.stop_texts = ("[/Answer]",)
         scfg.max_blocks = int(self.cfg.get("bench", {}).get("gen_max_blocks", scfg.max_blocks))
         return scfg
+
+    def latent_sampler_cfg(self) -> LatentSamplerCfg:
+        lcfg = LatentSamplerCfg.from_dict(self.cfg.get("latent_sampler", {}))
+        lcfg.stop_texts = ("[/Answer]",)
+        return lcfg
+
+    def generate(self, prompt_ids: list[int]):
+        """Block-diffusion generation, or the latent-guided sampler when the
+        checkpoint has the latent stack and bench.latent_mode is on."""
+        if self.editor.latent is not None and bool(self.bench("latent_mode", True)):
+            return generate_latent(
+                self.editor, self.editor.latent, self.bundle, prompt_ids, self.latent_sampler_cfg(), self.device
+            )
+        return generate(self.editor.mlm_call(), self.bundle, prompt_ids, self.sampler_cfg(), self.device)
 
     def bench(self, key: str, default):
         return self.cfg.get("bench", {}).get(key, default)
@@ -220,7 +235,6 @@ def task_gsm8k(ctx: BenchCtx) -> dict:
     n = int(ctx.bench("gsm8k_n", 100))
     ds = load_dataset("openai/gsm8k", "main", split="test")
     ds = ds.select(range(min(n, len(ds))))
-    scfg = ctx.sampler_cfg()
     correct = 0
     total = 0
     for ex in ds:
@@ -231,7 +245,7 @@ def task_gsm8k(ctx: BenchCtx) -> dict:
                 + "\nThink step by step and end with the final numeric answer after ####.",
             }]
         )
-        res = generate(ctx.editor.mlm_call(), ctx.bundle, prompt_ids, scfg, ctx.device)
+        res = ctx.generate(prompt_ids)
         gold = extract_number(ex["answer"])
         pred = extract_number(res.text)
         correct += int(numbers_equal(pred, gold))
@@ -279,7 +293,6 @@ def task_mbpp(ctx: BenchCtx) -> dict:
     n = int(ctx.bench("mbpp_n", 50))
     ds = load_dataset("google-research-datasets/mbpp", "sanitized", split="test")
     ds = ds.select(range(min(n, len(ds))))
-    scfg = ctx.sampler_cfg()
     ecfg = EditSamplerCfg.from_dict(ctx.cfg.get("edit_sampler", {}))
     self_repair = bool(ctx.bench("mbpp_self_repair", True))
     timeout = float(ctx.bench("exec_timeout_s", 5.0))
@@ -300,7 +313,7 @@ def task_mbpp(ctx: BenchCtx) -> dict:
                 + "\nWrite only the Python code.",
             }]
         )
-        res = generate(ctx.editor.mlm_call(), ctx.bundle, prompt_ids, scfg, ctx.device)
+        res = ctx.generate(prompt_ids)
         code = salvage_code(res.text)
         gen_valid += int(syntax_ok(code))
         test_block = "\n\n" + "\n".join(tests) + "\n"
@@ -461,3 +474,130 @@ def task_speed(ctx: BenchCtx) -> dict:
         if res.new_ids:
             rates.append(res.tokens_per_sec)
     return {"gen_tok_per_sec": sum(rates) / max(len(rates), 1)}
+
+
+# ---------- BrierLM (CALM Sec. 4): sample-based, likelihood-free ----------
+
+def _brierlm_from_scores(
+    plan_logits_list: list[torch.Tensor],  # per fine chunk: [K, V] plan logits
+    gold_chunks: list[list[int]],          # per fine chunk: [K] gold tokens
+    backbone_logits: torch.Tensor,         # [n_chunks*K, V] mean-field at masked positions
+    n_grams: tuple[int, ...] = (1, 2, 3, 4),
+    temperature: float = 0.7,
+    seed: int = 0,
+) -> dict:
+    """Brier-n over n-gram outcomes, estimated from 2 samples per position
+    (CALM eq. 14): Brier(P, y) ~= I{x1=y} + I{x2=y} - I{x1=x2}."""
+    rng = random.Random(seed)
+    gen = torch.Generator().manual_seed(seed)
+    flat = torch.cat([p for p in plan_logits_list], dim=0) + backbone_logits  # [M, V]
+    probs = torch.softmax(flat.float() / temperature, dim=-1)
+    n_pos = probs.shape[0]
+    s1 = torch.multinomial(probs, 1, generator=gen).squeeze(-1)
+    s2 = torch.multinomial(probs, 1, generator=gen).squeeze(-1)
+    gold = torch.tensor([t for c in gold_chunks for t in c], dtype=torch.long)
+    stats = {}
+    for n in n_grams:
+        total, hits = 0, 0.0
+        for p in range(n_pos - n + 1):
+            y = tuple(gold[p : p + n].tolist())
+            x1 = tuple(s1[p : p + n].tolist())
+            x2 = tuple(s2[p : p + n].tolist())
+            hits += (1 if x1 == y else 0) + (1 if x2 == y else 0) - (1 if x1 == x2 else 0)
+            total += 1
+        stats[f"brier_{n}"] = hits / max(total, 1)
+    brierlm = 1.0
+    for n in n_grams:
+        brierlm *= stats[f"brier_{n}"]
+    stats["brierlm"] = 100.0 * (brierlm ** (1.0 / len(n_grams)))
+    return stats
+
+
+def _latent_teacher_force(
+    ctx: BenchCtx, prefix_ids: list[int], gold_chunks: list[list[int]], cfg: LatentSamplerCfg
+) -> list[torch.Tensor]:
+    """Teacher-forced chunk-latent prediction (the model's plan logits per
+    gold fine chunk), mirroring the generation-time conditioning."""
+    latent = ctx.editor.latent
+    b = ctx.bundle
+    fpc = cfg.fine_per_coarse
+    k = cfg.fine_chunk_tokens
+    ctx_ids = list(prefix_ids)
+    prev_coarse = torch.zeros(1, 0, 2, dtype=torch.long, device=ctx.device)
+    prev_fine = torch.zeros(1, 0, 2, dtype=torch.long, device=ctx.device)
+    plan_logits: list[torch.Tensor] = []
+
+    def ctx_embed(ids):
+        from ..latent.sampler import _ctx_embed
+
+        return _ctx_embed(latent, ctx.editor, ids, ctx.device)
+
+    from ..latent.sampler import _plan_logits
+
+    for ci, chunk in enumerate(gold_chunks):
+        emb = ctx_embed(ctx_ids)
+        if ci % fpc == 0:
+            z_c, codes_c = latent.predict_coarse_latent(emb, prev_coarse, cfg.__dict__)
+            prev_coarse = torch.cat([prev_coarse, codes_c.unsqueeze(0)], dim=1)
+            prev_fine = torch.zeros(1, 0, 2, dtype=torch.long, device=ctx.device)
+        z_f, codes_f = latent.predict_fine_latent(emb, codes_c, prev_fine, cfg.__dict__)
+        plan_logits.append(_plan_logits(latent, ctx.editor, z_f, k, ctx.device))
+        prev_fine = torch.cat([prev_fine, codes_f.unsqueeze(0)], dim=1)
+        ctx_ids = ctx_ids + chunk
+    return plan_logits
+
+
+def task_brierlm(ctx: BenchCtx) -> dict:
+    """BrierLM (CALM Sec. 4): likelihood-free, sample-based LM metric. For each
+    fixture context we teacher-force the gold continuation through the model
+    (latent stack: plan codes + CFG residual -> adapter plan logits; token
+    model: masked-softmax baseline) and draw 2 samples per position.
+
+    Only needs samples, so it drops into the bench cleanly — and it correlates
+    with CE (-0.966 Pearson) where mode-averaged generation metrics hide."""
+    n = int(ctx.bench("brierlm_n", 16))
+    b = ctx.bundle
+    lcfg = ctx.latent_sampler_cfg()
+    k = lcfg.fine_chunk_tokens
+    fpc = lcfg.fine_per_coarse
+    total_chunks = 4
+    head = [b.bos_id] if b.bos_id is not None else [b.eos_id]
+    seeds = [0, 1]
+    agg: dict[str, list] = {}
+    used = 0
+    for code in load_snippets():
+        if used >= n:
+            break
+        ids = b.encode(code)
+        if len(ids) < 64:
+            continue
+        cut = len(ids) // 2
+        prefix, cont = ids[:cut], ids[cut : cut + k * total_chunks]
+        if len(cont) < k * total_chunks:
+            continue
+        gold_chunks = [cont[i * k : (i + 1) * k] for i in range(total_chunks)]
+        prefix_ids = head + prefix
+        masked_positions = list(range(len(prefix_ids), len(prefix_ids) + k * total_chunks))
+        x = list(prefix_ids) + [b.mask_id] * (k * total_chunks)
+        xt = torch.tensor([x], dtype=torch.long, device=ctx.device)
+        logits = ctx.editor.mlm_call()(xt)[0].float()  # mean-field backbone at masks
+        bb = logits[masked_positions, :]
+
+        if ctx.editor.latent is not None:
+            plans = _latent_teacher_force(ctx, prefix_ids, gold_chunks, lcfg)
+            for s in seeds:
+                r = _brierlm_from_scores(plans, gold_chunks, bb, seed=s)
+                for kk, v in r.items():
+                    agg.setdefault("latent_" + kk, []).append(v)
+        else:
+            plans = [torch.zeros_like(bb[:k]) for _ in range(total_chunks)]
+            for s in seeds:
+                r = _brierlm_from_scores(plans, gold_chunks, bb, seed=s)
+                for kk, v in r.items():
+                    agg.setdefault("sft_" + kk, []).append(v)
+        used += 1
+    if not agg:
+        return {"error": "no usable fixtures"}
+    out = {kk: sum(v) / len(v) for kk, v in agg.items()}
+    out["n"] = used
+    return out

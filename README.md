@@ -31,6 +31,7 @@ On top of it, this repo adds:
 | 2b `edit_rollin` | `configs/stage2b_rollin.yaml` | stage 2 | **Roll-in**: edit labels from aligning the model's own outputs against references |
 | 3 `jepa` | `configs/stage3_jepa.yaml` | stage 1 | Same as stage 2 **plus** JEPA loss — clean ablation vs stage 2 |
 | 4 `grpo` | `configs/stage4_grpo.yaml` | stage 2 | Experimental RLVR on repair |
+| 5 `latent` | `configs/stage5_latent.yaml` | stage 2 | **Multi-granularity latent JEPA** on frozen teacher latents (GRM-3.2-Turf, precomputed — never loaded in training): coarse plan at 1/32 token rate (RVQ code anchors + AR prior), fine level at 1/8 rate conditioned on the quantized coarse latent, continuous detail from an energy-trained residual head, CFG-guided sampling, plus a decodability adapter (variational + KL-clip + dual dropout) decoding latents to tokens through the tied LM head |
 
 Roll-in (stage 2b) attacks the two gaps synthetic corruption can't: the
 localization gap (heads must fix states the *model* visits, not just random
@@ -42,6 +43,18 @@ self-fills — recovers edit labels via a Levenshtein alignment backtrace
 `rollin_edit_mass` in the metrics: it is the mean edit distance of the model's
 own outputs from the reference, and should FALL as roll-in training works.
 
+Stage 5 is the distillation idea from the prompt: the teacher's pooled hidden
+states (L2-normalized, per-chunk at two granularities, CALM-style token-mask
+dropout) are written once by `scripts/precompute_latents.py` into a memmap
+store, and training consumes only that store — so a ~2h demo run fits on one
+5090 while the student still inherits the teacher's semantic/context-aware
+properties. Generation runs the latent pipeline first (AR plan codes → CFG
+energy residuals → adapter plan logits) and then fills tokens with the
+block-diffusion filler *plus* the plan prior; committed chunks are re-encoded
+and rejected on cycle-consistency drift. Evaluation adds **BrierLM** (CALM
+Sec. 4): a likelihood-free, sample-based n-gram metric on teacher-forced
+plan logits that correlates with CE (-0.966) where mode-averaged metrics hide.
+
 Data mix (streamed from HF, weights in `configs/base.yaml`): smoltalk (chat +
 reasoning) 30%, Magicoder-OSS-Instruct (code) 25%, MetaMathQA (math) 20%,
 codeparrot-clean (raw Python, feeds infill + edit training) 25%.
@@ -49,8 +62,8 @@ codeparrot-clean (raw Python, feeds infill + edit training) 25%.
 Each stage ends with an automatic **benchmark**: chat masked-CE, ARC-Easy
 (likelihood MC), GSM8K EM, MBPP pass@1 (sandboxed execution), plus the
 signature evals — self-located **repair** (exact / syntax-valid / Levenshtein
-reduction) and **infill** — and generation speed. Results land in
-`runs/<experiment>/<stage>/bench/` and render in the WebUI.
+reduction), **infill**, **BrierLM** (stage-5 runs), and generation speed.
+Results land in `runs/<experiment>/<stage>/bench/` and render in the WebUI.
 
 ## Setup on the training box (RTX 5090)
 
@@ -78,6 +91,10 @@ python -m pytest tests/ -q
 python scripts/train.py --config configs/stage1_sft.yaml
 python scripts/train.py --config configs/stage2_edit.yaml
 python scripts/train.py --config configs/stage3_jepa.yaml
+
+# stage 5: latent JEPA on frozen teacher latents
+python scripts/precompute_latents.py --config configs/stage5_latent.yaml
+python scripts/train.py --config configs/stage5_latent.yaml
 
 # or the whole ladder (skips stages whose final checkpoint exists)
 python scripts/run_all.py
@@ -109,6 +126,7 @@ Defaults: micro-batch 8 × grad-accum 8 × 1024 tokens ≈ 65k tokens/step.
 | sft | 3000 | ~200M | 3–4 h |
 | edit | 2000 | ~130M (3 views/edit batch) | 3–4 h |
 | jepa | 2000 | same + EMA/target passes | 4–5 h |
+| latent | 1500 | ~100M + precompute pass | 1.5–2 h (+ ~1h precompute) |
 | bench per stage | — | — | 20–40 min |
 
 That fits the "couple of days" budget with room for a config iteration. Raise

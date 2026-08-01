@@ -1,8 +1,10 @@
-"""Run the full pipeline: stage1 (sft) -> stage2 (edit) -> stage3 (jepa).
+"""Run the full pipeline: stage1 (sft) -> stage2 (edit) -> stage3 (jepa)
+-> stage5 (latent JEPA on precomputed teacher latents).
 
 Each stage benchmarks at its end; results land in runs/<experiment>/<stage>/
 and show up in the WebUI. Stages whose final checkpoint already exists are
-skipped unless --force."""
+skipped unless --force. Stage 5 needs the latent store built first by
+scripts/precompute_latents.py (the runner prints a reminder and skips it)."""
 
 from __future__ import annotations
 
@@ -14,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from levencode.config import cfg_get, load_config
 
-STAGES = ["stage1_sft.yaml", "stage2_edit.yaml", "stage3_jepa.yaml"]
+STAGES = ["stage1_sft.yaml", "stage2_edit.yaml", "stage3_jepa.yaml", "stage5_latent.yaml"]
 
 
 def main() -> None:
@@ -33,6 +35,12 @@ def main() -> None:
         final = Path(cfg_get(cfg, "run.runs_dir", "runs")) / exp / stage / "ckpt" / "final"
         if final.exists() and not args.force:
             print(f"[run_all] {stage}: final checkpoint exists, skipping")
+            continue
+        if stage == "latent" and not Path(cfg_get(cfg, "latent.store")).exists():
+            print(
+                "[run_all] latent: store not found — run first:\n"
+                "  python scripts/precompute_latents.py --config configs/stage5_latent.yaml"
+            )
             continue
         print(f"[run_all] === stage {stage} ===")
         from levencode.train.trainer import Trainer

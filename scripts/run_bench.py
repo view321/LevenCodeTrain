@@ -20,6 +20,7 @@ from levencode.config import apply_overrides, cfg_get, load_config
 from levencode.model.backbone import load_tokenizer_bundle
 from levencode.model.editor import build_editor
 from levencode.train.state import RunDir
+from levencode.train.trainer import latent_kwargs_from_config
 from levencode.util import resolve_device
 
 
@@ -42,11 +43,14 @@ def main() -> None:
         cfg.setdefault("run", {})["device"] = args.device
     device = resolve_device(cfg_get(cfg, "run.device", "auto"))
     bundle = load_tokenizer_bundle(cfg_get(cfg, "model.repo_id"))
+    has_latent = bool(args.ckpt and (Path(args.ckpt) / "latent.pt").exists())
     editor = build_editor(
         args.ckpt or cfg_get(cfg, "model.repo_id"),
         insert_max=int(cfg_get(cfg, "model.insert_max", 8)),
         device=device,
         dtype=torch.float32,
+        with_latent=has_latent,
+        latent_kwargs=latent_kwargs_from_config(cfg),
     )
     results = run_benchmark(editor, bundle, cfg, device, only=args.only)
 

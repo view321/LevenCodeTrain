@@ -78,7 +78,20 @@ train:
     jepa: 0.0
     delete_pos_weight: 2.0    # junk labels are ~10%; upweight so the head learns to delete
     insert_zero_weight: 0.5   # count-0 gaps are ~90%; downweight so the head learns to insert
+    # latent stage (mixture-of-JEPAs) weights
+    coarse_ce: 1.0
+    fine_ce: 1.0
+    coarse_energy: 1.0
+    fine_energy: 1.0
+    coarse_scorer: 0.5
+    fine_scorer: 0.5
+    mse: 0.1
+    commit: 0.25
+    decodability: 1.0
   retain_sft_frac: 0.5       # in edit stages, fraction of batches kept on the SFT objective
+  latent_frac: 0.35          # latent stage: fraction of micro-batches on the JEPA stack
+  decodability_frac: 0.15    # latent stage: fraction on adapter token-CE decode
+  edit_frac: 0.20            # latent stage: fraction keeping the edit heads alive
 
 jepa:
   enabled: false
@@ -86,6 +99,44 @@ jepa:
   predictor_heads: 8
   ema_start: 0.996
   ema_end: 0.9995
+
+latent:
+  enabled: false
+  # Frozen teacher whose pooled hidden states become the latent space. The
+  # student never loads this model during training (latents are precomputed).
+  teacher: OrionLLM/GRM-3.2-Turf
+  store: runs/precompute/demo      # written by scripts/precompute_latents.py
+  latent_dim: 2048                 # teacher hidden size (LFM2.5-1.2B)
+  # RVQ discrete anchor: R books x codebook_size; the residual is continuous.
+  rvq_books: 2
+  rvq_codebook_size: 2048
+  rvq_ema_decay: 0.99
+  rvq_commit: 0.25
+  # AR code prior + residual head + energy scorer (per level)
+  ar_dim: 512
+  ar_layers: 3
+  residual_blocks: 3
+  energy_hidden: 256
+  # decodability adapter (CALM recipe: variational bottleneck + KL clip +
+  # dual dropout; token-CE decode through the tied LM head)
+  bottleneck_dim: 128
+  adapter_layers: 2
+  adapter_hidden: 512
+  adapter_heads: 8
+  max_chunk: 16
+  kl_beta: 0.001
+  kl_clip: 0.5
+  dropout_latent: 0.15
+  cfg_dropout: 0.2           # condition dropout for CFG-trained scorer/head
+  residual_n_samples: 8
+  residual_m_targets: 100
+  residual_target_noise: 0.02
+  residual_mse: 0.1
+  scorer_margin: 1.0
+  # data windowing
+  ctx_len: 192               # student-encoder context tokens per latent batch
+  coarse_window: 4           # coarse chunks per latent batch row
+  fine_window: 4             # fine chunks per row (within one coarse chunk)
 
 rollin:
   enabled: false             # roll-in: train edit heads on the model's own outputs
@@ -114,6 +165,24 @@ edit_sampler:
   ins_zero_penalty: 0.0
   fill_steps: 8
 
+latent_sampler:
+  # Latent-guided generation: plan codes (discrete anchor) + CFG-scored
+  # residual (energy head) + plan-prior block filler + cycle-consistency
+  # rejection against the frozen teacher.
+  fine_chunk_tokens: 8
+  fine_per_coarse: 4
+  plan_temperature: 0.8
+  plan_top_p: 0.9
+  residual_candidates: 8
+  cfg_weight: 1.0            # classifier-free guidance on the energy score
+  plan_weight: 1.0           # plan logits mixing into the block filler
+  fill_steps: 8
+  max_coarse_chunks: 6
+  cycle_consistency: true
+  cycle_threshold: 0.75
+  cycle_retries: 2
+  max_total_len: 4096
+
 bench:
   at_stage_end: true
   arc_n: 200
@@ -124,3 +193,5 @@ bench:
   infill_n: 40
   gen_max_blocks: 6
   exec_timeout_s: 5.0
+  latent_mode: true          # use the latent sampler when the checkpoint has it
+  brierlm_n: 16

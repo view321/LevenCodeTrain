@@ -1,0 +1,36 @@
+# Stage 5 "latent": the mixture-of-JEPAs training stage on precomputed
+# teacher latents (GRM-3.2-Turf). Starts from the stage-2 checkpoint so the
+# editor heads and the block-diffusion filler stay alive, then trains:
+#   - coarse JEPA (1/32 token rate): AR plan codes + energy residual
+#   - fine JEPA (1/8 token rate) conditioned on the quantized coarse latent
+#   - decodability adapter (variational + KL clip + dual dropout, token-CE)
+#   - CFG-trained energy scorers (condition dropout)
+# with SFT + edit retention fractions to keep the token-level stack sharp.
+#
+# Prerequisite: scripts/precompute_latents.py --config configs/stage5_latent.yaml
+# Wall clock (5090, defaults): ~1.5-2h for total_steps=1500.
+
+_extends: base.yaml
+
+stage: latent
+init_from: runs/levencode/edit/ckpt/final   # backbone + edit heads from stage 2
+
+run:
+  name: latent
+
+latent:
+  enabled: true
+  store: runs/precompute/demo
+
+train:
+  micro_batch_size: 8
+  grad_accum: 8
+  lr: 3.0e-5
+  warmup_steps: 150
+  total_steps: 1500
+  ckpt_every: 500
+  sample_every: 250
+  latent_frac: 0.35
+  decodability_frac: 0.15
+  edit_frac: 0.20
+  retain_sft_frac: 0.50

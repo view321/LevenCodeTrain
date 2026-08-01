@@ -25,6 +25,8 @@ from ..data.collators import IGNORE, DiffusionSFTCollator, EditCollator
 from ..data.corruption import CorruptionCfg
 from ..data.mix import build_edit_stream, build_mixture
 from ..data.tokens import TokenizerBundle
+from ..latent.sampler import LatentSamplerCfg, generate_latent
+from ..latent.teacher import PrecomputedLatents
 from ..model.backbone import load_tokenizer_bundle
 from ..model.editor import LevencodeEditor, build_editor
 from ..model.jepa import ema_momentum
@@ -45,6 +47,26 @@ GALLERY_PROMPTS = [
     [{"role": "user", "content": "What is 17 * 24? Think step by step and give the final answer after ####."}],
     [{"role": "user", "content": "Explain in two sentences what a hash map is."}],
 ]
+
+_LATENT_KEYS = (
+    "latent_dim", "rvq_books", "codebook_size", "rvq_ema_decay", "rvq_commit",
+    "ar_dim", "ar_layers", "residual_blocks", "energy_hidden",
+    "bottleneck_dim", "adapter_layers", "adapter_hidden", "adapter_heads", "max_chunk",
+    "kl_beta", "kl_clip", "dropout_latent",
+    "cfg_dropout", "residual_n_samples", "residual_m_targets", "residual_target_noise",
+    "residual_mse", "scorer_margin",
+)
+
+
+def latent_kwargs_from_config(cfg: dict) -> dict:
+    """LatentBundle constructor kwargs from the latent config section
+    (config aliases -> constructor names). Shared by the trainer, bench, and
+    run_bench so checkpoint loading never drifts from training."""
+    lc = cfg.get("latent", {})
+    kw = {k: lc.get(k, None) for k in _LATENT_KEYS if lc.get(k, None) is not None}
+    if "codebook_size" not in kw and lc.get("rvq_codebook_size", None) is not None:
+        kw["codebook_size"] = lc["rvq_codebook_size"]
+    return kw
 
 
 class MetricAcc:
@@ -79,8 +101,8 @@ class Trainer:
     ):
         self.cfg = cfg
         self.stage = cfg["stage"]
-        if self.stage not in ("sft", "edit", "jepa"):
-            raise ValueError(f"Trainer handles sft/edit/jepa, not {self.stage!r} (grpo has its own runner)")
+        if self.stage not in ("sft", "edit", "jepa", "latent"):
+            raise ValueError(f"Trainer handles sft/edit/jepa/latent, not {self.stage!r} (grpo has its own runner)")
         self.device = resolve_device(cfg_get(cfg, "run.device", "auto"))
         set_seed(int(cfg_get(cfg, "run.seed", 1337)))
         self.rng = random.Random(cfg_get(cfg, "run.seed", 1337))
@@ -89,6 +111,7 @@ class Trainer:
         self.bundle = bundle or load_tokenizer_bundle(repo)
         init_from = cfg.get("init_from") or repo
         with_jepa = bool(cfg_get(cfg, "jepa.enabled", False))
+        self.with_latent = bool(cfg_get(cfg, "latent.enabled", False))
         self.editor: LevencodeEditor = build_editor(
             init_from,
             insert_max=int(cfg_get(cfg, "model.insert_max", 8)),
@@ -99,8 +122,19 @@ class Trainer:
                 predictor_layers=int(cfg_get(cfg, "jepa.predictor_layers", 2)),
                 predictor_heads=int(cfg_get(cfg, "jepa.predictor_heads", 8)),
             ),
+            with_latent=self.with_latent,
+            latent_kwargs=self._latent_kwargs(),
         )
         self.with_jepa = with_jepa
+
+        self.store: PrecomputedLatents | None = None
+        if self.with_latent:
+            store_path = cfg_get(cfg, "latent.store")
+            self.store = PrecomputedLatents(store_path)
+            if not self.store.exists():
+                raise FileNotFoundError(
+                    f"latent store {store_path!r} not found — run scripts/precompute_latents.py first"
+                )
 
         max_len = int(cfg_get(cfg, "model.max_seq_len", 1024))
         seed = int(cfg_get(cfg, "run.seed", 1337))
@@ -157,6 +191,9 @@ class Trainer:
 
     # ---------- setup ----------
 
+    def _latent_kwargs(self) -> dict:
+        return latent_kwargs_from_config(self.cfg)
+
     def _build_optimizer(self, t: dict) -> torch.optim.AdamW:
         decay, no_decay = [], []
         for name, p in self.editor.named_parameters():
@@ -188,6 +225,38 @@ class Trainer:
         if self._edit_iter is None:
             self._edit_iter = build_edit_stream(self.cfg["data"], int(cfg_get(self.cfg, "run.seed", 1337)))
         return self._edit_iter
+
+    def latent_stream(self) -> Iterator[dict]:
+        """Iterator over latent training batches from the precomputed store."""
+        store = self.store
+        manifest = store.manifest()
+        n = int(manifest["n_samples"])
+        ctx_len = int(cfg_get(self.cfg, "latent.ctx_len", 192))
+        cw = int(cfg_get(self.cfg, "latent.coarse_window", 4))
+        fw = int(cfg_get(self.cfg, "latent.fine_window", 4))
+        bs = int(self.cfg.get("train", {}).get("latent_micro_batch_size", self.micro_bs))
+        epoch = 0
+        while True:
+            perm = list(range(n))
+            self.rng.shuffle(perm)
+            for i in range(0, n, bs):
+                idxs = perm[i : i + bs]
+                batch = store.batch(idxs, ctx_len, cw, fw, seed=self.rng.randrange(10**9), pad_id=self.bundle.pad_id)
+                if batch is not None:
+                    yield batch
+            epoch += 1
+
+    def decodability_stream(self) -> Iterator[dict]:
+        store = self.store
+        manifest = store.manifest()
+        n = int(manifest["n_samples"])
+        bs = int(self.cfg.get("train", {}).get("decodability_micro_batch_size", self.micro_bs))
+        chunk_tokens = int(cfg_get(self.cfg, "latent.max_chunk", 16))
+        while True:
+            idxs = [self.rng.randrange(n) for _ in range(bs * 4)]
+            batch = store.decodability_batch(idxs, chunk_tokens, bs, seed=self.rng.randrange(10**9))
+            if batch is not None:
+                yield batch
 
     def _next_batch(self, collator, stream: Iterator[dict], micro_bs: int) -> dict:
         for _ in range(50):
@@ -299,6 +368,41 @@ class Trainer:
         metrics.add("fill_view_acc", facc.item())
         return total_display
 
+    def _latent_step(self, batch: dict, metrics: MetricAcc) -> float:
+        """The mixture of JEPAs: coarse + fine latent predictors, energy
+        residuals, CFG-trained scorers. One student encoder forward on a short
+        context; everything else is cheap (small transformers / MLPs)."""
+        att = (batch["ctx_ids"] != self.bundle.pad_id).long()
+        with self.autocast:
+            h = self.editor.hidden(batch["ctx_ids"], att)
+            out = self.editor.latent.latent_step(batch, h, self.device)
+        w = self.loss_w
+        total = (
+            float(w.get("coarse_ce", 1.0)) * out["coarse_ce"]
+            + float(w.get("fine_ce", 1.0)) * out["fine_ce"]
+            + float(w.get("coarse_energy", 1.0)) * out["coarse_energy"]
+            + float(w.get("fine_energy", 1.0)) * out["fine_energy"]
+            + float(w.get("coarse_scorer", 0.5)) * out["coarse_scorer"]
+            + float(w.get("fine_scorer", 0.5)) * out["fine_scorer"]
+            + float(w.get("mse", 0.1)) * 0.5 * (out["coarse_mse"] + out["fine_mse"])
+            + float(w.get("commit", 0.25)) * out["commit"]
+        )
+        (total / self.grad_accum).backward()
+        for k, v in out.items():
+            metrics.add(k, v.item())
+        return total.item()
+
+    def _decodability_step(self, batch: dict, metrics: MetricAcc) -> float:
+        """Token-CE decode of teacher latents through the tied LM head."""
+        with self.autocast:
+            out = self.editor.latent.decodability_step(batch, self.backbone_lm_head)
+        total = float(self.loss_w.get("decodability", 1.0)) * out["decodability"]
+        (total / self.grad_accum).backward()
+        metrics.add("decodability_ce", out["decodability_ce"].item())
+        metrics.add("decodability_kl", out["decodability_kl"].item())
+        metrics.add("decodability_acc", out["decodability_acc"].item())
+        return total.item()
+
     # ---------- main loop ----------
 
     def train(self) -> None:
@@ -323,9 +427,43 @@ class Trainer:
 
                 step_loss = 0.0
                 n_edit = 0
+                n_latent = 0
                 for _ in range(self.grad_accum):
                     use_edit = self.stage in ("edit", "jepa") and self.rng.random() > self.retain_frac
-                    if use_edit:
+                    if self.with_latent:
+                        # latent-stage micro-batch lottery: latent / decodability
+                        # / edit / sft retention
+                        r = self.rng.random()
+                        lat_frac = float(cfg_get(self.cfg, "train.latent_frac", 0.35))
+                        dec_frac = float(cfg_get(self.cfg, "train.decodability_frac", 0.15))
+                        edit_frac = float(cfg_get(self.cfg, "train.edit_frac", 0.20))
+                        if r < lat_frac:
+                            batch = self._to(
+                                next(self.latent_stream()), self.device,
+                            )
+                            loss_val = self._latent_step(batch, window)
+                            n_tok = batch["ctx_ids"].numel()
+                            n_latent += 1
+                        elif r < lat_frac + dec_frac:
+                            batch = self._to(next(self.decodability_stream()), self.device)
+                            loss_val = self._decodability_step(batch, window)
+                            n_tok = batch["tokens"].numel()
+                        elif r < lat_frac + dec_frac + edit_frac:
+                            batch = self._to(
+                                self._next_batch(self.edit_collator, self.edit_stream(), self.edit_micro_bs),
+                                self.device,
+                            )
+                            loss_val = self._edit_step(batch, window)
+                            n_tok = sum(v["input_ids"].numel() for v in batch.values())
+                            n_edit += 1
+                        else:
+                            batch = self._to(
+                                self._next_batch(self.sft_collator, self.sft_stream(), self.micro_bs),
+                                self.device,
+                            )
+                            loss_val = self._sft_step(batch, window)
+                            n_tok = batch["input_ids"].numel()
+                    elif use_edit:
                         batch = None
                         from_rollin = (
                             self.rollin is not None
@@ -362,6 +500,8 @@ class Trainer:
                 self.opt.step()
                 window.add("loss", step_loss)
                 window.add("edit_frac", n_edit / self.grad_accum)
+                if self.with_latent:
+                    window.add("latent_frac", n_latent / self.grad_accum)
 
                 if self.with_jepa:
                     m = ema_momentum(
@@ -405,13 +545,20 @@ class Trainer:
     def _dump_samples(self, step: int) -> None:
         try:
             self.editor.eval()
-            scfg = BlockSamplerCfg.from_dict(self.cfg.get("sampler", {}))
-            scfg.stop_texts = ("[/Answer]",)
             samples = []
             with self.autocast:
                 for messages in GALLERY_PROMPTS:
                     prompt_ids = self.bundle.chat_prompt_ids(messages)
-                    res = generate(self.editor.mlm_call(), self.bundle, prompt_ids, scfg, self.device)
+                    if self.editor.latent is not None:
+                        scfg = LatentSamplerCfg.from_dict(self.cfg.get("latent_sampler", {}))
+                        scfg.stop_texts = ("[/Answer]",)
+                        res = generate_latent(
+                            self.editor, self.editor.latent, self.bundle, prompt_ids, scfg, self.device
+                        )
+                    else:
+                        scfg = BlockSamplerCfg.from_dict(self.cfg.get("sampler", {}))
+                        scfg.stop_texts = ("[/Answer]",)
+                        res = generate(self.editor.mlm_call(), self.bundle, prompt_ids, scfg, self.device)
                     samples.append(
                         {
                             "prompt": messages[-1]["content"],

@@ -11,6 +11,7 @@ from ..data.tokens import TokenizerBundle
 from .tasks import (
     BenchCtx,
     task_arc_easy,
+    task_brierlm,
     task_chat,
     task_gsm8k,
     task_infill,
@@ -27,6 +28,7 @@ TASKS = {
     "repair": task_repair,
     "infill": task_infill,
     "speed": task_speed,
+    "brierlm": task_brierlm,
 }
 
 

@@ -4,6 +4,7 @@ Checkpoint layout under <dir>/:
   backbone/   HF save_pretrained (weights + config + custom modeling code)
   heads.pt    edit-head weights + meta
   jepa.pt     predictor weights (target encoder is rebuilt from the backbone)
+  latent.pt   latent JEPA stack (RVQ + decodability adapter + level heads)
 """
 
 from __future__ import annotations
@@ -21,11 +22,23 @@ from .jepa import JepaModule
 
 
 class LevencodeEditor(nn.Module):
-    def __init__(self, backbone, insert_max: int, jepa: JepaModule | None = None):
+    def __init__(
+        self,
+        backbone,
+        insert_max: int,
+        jepa: JepaModule | None = None,
+        latent=None,
+        latent_kwargs: dict | None = None,
+    ):
         super().__init__()
         self.backbone = backbone
         self.heads = EditHeads(backbone.config.hidden_size, insert_max)
         self.jepa = jepa
+        if latent is None and latent_kwargs:
+            from ..latent.bundle import LatentBundle
+
+            latent = LatentBundle(latent_dim=latent_kwargs["latent_dim"], student_hidden=backbone.config.hidden_size, **{k: v for k, v in latent_kwargs.items() if k != "latent_dim"})
+        self.latent = latent
 
     @property
     def insert_max(self) -> int:
@@ -80,6 +93,8 @@ class LevencodeEditor(nn.Module):
         )
         if self.jepa is not None:
             torch.save({"predictor": self.jepa.predictor.state_dict()}, ckpt_dir / "jepa.pt")
+        if self.latent is not None:
+            torch.save({"latent": self.latent.state_dict()}, ckpt_dir / "latent.pt")
 
     @classmethod
     def load(
@@ -90,6 +105,8 @@ class LevencodeEditor(nn.Module):
         insert_max: int | None = None,
         with_jepa: bool = False,
         jepa_kwargs: dict | None = None,
+        with_latent: bool = False,
+        latent_kwargs: dict | None = None,
     ) -> "LevencodeEditor":
         ckpt_dir = Path(ckpt_dir)
         backbone = load_backbone(str(ckpt_dir / "backbone"), dtype=dtype, device=device)
@@ -103,7 +120,18 @@ class LevencodeEditor(nn.Module):
             if jpath.exists():
                 jstate = torch.load(jpath, map_location="cpu", weights_only=True)
                 jepa.predictor.load_state_dict(jstate["predictor"])
-        editor = cls(backbone, k, jepa)
+        latent = None
+        if with_latent:
+            from ..latent.bundle import LatentBundle
+
+            lk = dict(latent_kwargs or {})
+            ldim = lk.pop("latent_dim", backbone.config.hidden_size)
+            latent = LatentBundle(latent_dim=ldim, student_hidden=backbone.config.hidden_size, **lk)
+            lpath = ckpt_dir / "latent.pt"
+            if lpath.exists():
+                lstate = torch.load(lpath, map_location="cpu", weights_only=True)
+                latent.load_state_dict(lstate["latent"])
+        editor = cls(backbone, k, jepa, latent)
         if meta:
             editor.heads.load_state_dict(meta["heads"])
         return editor.to(device)
@@ -116,6 +144,8 @@ def build_editor(
     dtype: torch.dtype = torch.float32,
     with_jepa: bool = False,
     jepa_kwargs: dict | None = None,
+    with_latent: bool = False,
+    latent_kwargs: dict | None = None,
 ) -> LevencodeEditor:
     """Build from either a levencode checkpoint dir (has backbone/) or a fresh
     HF repo id / local snapshot (backbone only, heads randomly initialized)."""
@@ -124,9 +154,17 @@ def build_editor(
         return LevencodeEditor.load(
             p, device=device, dtype=dtype, insert_max=insert_max,
             with_jepa=with_jepa, jepa_kwargs=jepa_kwargs,
+            with_latent=with_latent, latent_kwargs=latent_kwargs,
         )
     backbone = load_backbone(str(repo_or_ckpt), dtype=dtype, device=device)
     jepa = None
     if with_jepa:
         jepa = JepaModule(backbone.lfm2, backbone.config.hidden_size, **(jepa_kwargs or {}))
-    return LevencodeEditor(backbone, insert_max, jepa).to(device)
+    latent = None
+    if with_latent:
+        from ..latent.bundle import LatentBundle
+
+        lk = dict(latent_kwargs or {})
+        ldim = lk.pop("latent_dim", backbone.config.hidden_size)
+        latent = LatentBundle(latent_dim=ldim, student_hidden=backbone.config.hidden_size, **lk)
+    return LevencodeEditor(backbone, insert_max, jepa, latent).to(device)
