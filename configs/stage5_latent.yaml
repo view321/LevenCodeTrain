@@ -22,6 +22,14 @@ latent:
   enabled: true
   store: runs/precompute/demo
 
+diffusion:
+  # The latent filler works in fine_chunk_tokens=8 canvases, but stages 1-2
+  # never trained a block below 16 tokens — a fresh 8-mask canvas is OOD and
+  # greedy fill closes it with the answer terminator immediately (empty MBPP
+  # generations in the latentB ablation, 2026-08). Teach small canvases during
+  # stage-5 SFT retention.
+  block_size_min: 8
+
 train:
   micro_batch_size: 8
   grad_accum: 8
