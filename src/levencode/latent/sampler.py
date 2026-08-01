@@ -124,7 +124,8 @@ def _fill_plan_block(
         pos = torch.tensor(masked, dtype=torch.long, device=x.device)
         if cfg.plan_weight != 0.0:
             logits = logits.clone()
-            logits[0, pos] = logits[0, pos] + cfg.plan_weight * plan_logits[pos - base]
+            mix = (cfg.plan_weight * plan_logits[pos - base]).to(logits.dtype)
+            logits[0, pos] = logits[0, pos] + mix
         tok, conf = pick_token(logits[0, pos], cfg.temperature, cfg.top_p, None)
         kk = math.ceil(len(masked) / (cfg.fill_steps - step))
         kk = min(kk, len(masked))

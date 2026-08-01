@@ -489,8 +489,8 @@ def _brierlm_from_scores(
     """Brier-n over n-gram outcomes, estimated from 2 samples per position
     (CALM eq. 14): Brier(P, y) ~= I{x1=y} + I{x2=y} - I{x1=x2}."""
     rng = random.Random(seed)
-    gen = torch.Generator().manual_seed(seed)
     flat = torch.cat([p for p in plan_logits_list], dim=0) + backbone_logits  # [M, V]
+    gen = torch.Generator(device=flat.device).manual_seed(seed)
     probs = torch.softmax(flat.float() / temperature, dim=-1)
     n_pos = probs.shape[0]
     s1 = torch.multinomial(probs, 1, generator=gen).squeeze(-1)
