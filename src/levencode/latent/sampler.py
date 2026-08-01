@@ -51,6 +51,9 @@ class LatentSamplerCfg:
     code_history: int = 4  # AR prior context in coarse chunks; training never
     # sees windows longer than latent.coarse_window, so cap the history there
     # instead of conditioning on untrained sequence lengths
+    ctx_len: int = 192  # student-context pooling window — keep = latent.ctx_len:
+    # training pools the last ctx_len tokens (store.batch), so pooling the full
+    # committed sequence here would shift the ctx-embed distribution
     cycle_consistency: bool = True
     cycle_threshold: float = 0.75
     cycle_retries: int = 2
@@ -88,8 +91,8 @@ class _CycleTeacher:
 
 
 @torch.no_grad()
-def _ctx_embed(latent: LatentBundle, editor, ids: Sequence[int], device) -> torch.Tensor:
-    x = torch.tensor([list(ids)], dtype=torch.long, device=device)
+def _ctx_embed(latent: LatentBundle, editor, ids: Sequence[int], device, ctx_len: int = 192) -> torch.Tensor:
+    x = torch.tensor([list(ids)[-ctx_len:]], dtype=torch.long, device=device)
     h = editor.hidden(x, None)
     return latent.heads.ctx_embed(h.mean(dim=1))
 
@@ -111,8 +114,11 @@ def _fill_plan_block(
     k: int,
     cfg: LatentSamplerCfg,
     device,
+    plan_weight: float,
 ) -> tuple[list[int], int]:
-    """Iterative unmask of k mask positions with backbone + plan prior mixing."""
+    """Iterative unmask of k mask positions with backbone + plan prior mixing.
+    plan_weight is passed explicitly (retries halve it) so the shared cfg is
+    never mutated mid-generation."""
     x = torch.tensor([ids], dtype=torch.long, device=device)
     masked = list(range(base, base + k))
     forwards = 0
@@ -122,9 +128,9 @@ def _fill_plan_block(
         logits = mlm_call(x)
         forwards += 1
         pos = torch.tensor(masked, dtype=torch.long, device=x.device)
-        if cfg.plan_weight != 0.0:
+        if plan_weight != 0.0:
             logits = logits.clone()
-            mix = (cfg.plan_weight * plan_logits[pos - base]).to(logits.dtype)
+            mix = (plan_weight * plan_logits[pos - base]).to(logits.dtype)
             logits[0, pos] = logits[0, pos] + mix
         tok, conf = pick_token(logits[0, pos], cfg.temperature, cfg.top_p, None)
         kk = math.ceil(len(masked) / (cfg.fill_steps - step))
@@ -150,7 +156,10 @@ def _cycle_score(
     x = torch.tensor([ids], dtype=torch.long, device=device)
     h = model(x, use_cache=False, output_hidden_states=True).hidden_states[-1][0].float()
     vec = torch.nn.functional.normalize(h[span[0] : span[1]].mean(0), dim=-1)
-    return float((vec * z_pred).sum())
+    # z_pred = z_q + residual candidate is only approximately unit-norm; a raw
+    # dot product would conflate norm drift with directional agreement
+    zp = torch.nn.functional.normalize(z_pred.float(), dim=-1)
+    return float((vec * zp).sum())
 
 
 @torch.no_grad()
@@ -171,32 +180,41 @@ def generate_latent(
     K_f = cfg.fine_chunk_tokens
     K_c = K_f * cfg.fine_per_coarse
     prev_coarse = torch.zeros(1, 0, 2, dtype=torch.long, device=device)
+    window_ctx: torch.Tensor | None = None
     cycle_cosines: list[float] = []
 
     for _ in range(cfg.max_coarse_chunks):
         if len(ids) + K_c > cfg.max_total_len:
             break
-        ctx_embed = _ctx_embed(latent, editor, ids, device)
-        z_c, codes_c = latent.predict_coarse_latent(ctx_embed, prev_coarse, cfg.__dict__)
+        # training pins the context at the code window's start (store.batch:
+        # ctx = text before chunk c0, codes c0..c0+W-1), so the coarse ctx
+        # embed is refreshed only when a new window opens — advancing it every
+        # chunk would overlap the ctx text with the chunks in the code history,
+        # a conditioning pattern the prior never trained on
+        if prev_coarse.shape[1] == 0 or window_ctx is None:
+            window_ctx = _ctx_embed(latent, editor, ids, device, cfg.ctx_len)
+        z_c, codes_c = latent.predict_coarse_latent(window_ctx, prev_coarse, cfg.__dict__)
         chunk_start = len(ids)
+        # fine ctx is pinned at THIS coarse chunk's start for the whole fine
+        # window (training: ctx = text before the fine chunks' own coarse
+        # chunk), not recomputed per fine chunk
+        fine_ctx = window_ctx if prev_coarse.shape[1] == 0 else _ctx_embed(latent, editor, ids, device, cfg.ctx_len)
 
         best_try, best_cos = None, -1.0
-        plan_weight = cfg.plan_weight
         for attempt in range(cfg.cycle_retries + 1):
-            cfg.plan_weight = plan_weight * (0.5**attempt)
+            plan_w = cfg.plan_weight * (0.5**attempt)
             chunk_ids = list(ids)
             prev_fine = torch.zeros(1, 0, 2, dtype=torch.long, device=device)
             stopped = False
             for j in range(cfg.fine_per_coarse):
                 if len(chunk_ids) + K_f > cfg.max_total_len:
                     break
-                ctx_embed_j = _ctx_embed(latent, editor, chunk_ids, device)
-                z_f, codes_f = latent.predict_fine_latent(ctx_embed_j, codes_c, prev_fine, cfg.__dict__)
+                z_f, codes_f = latent.predict_fine_latent(fine_ctx, codes_c, prev_fine, cfg.__dict__)
                 plan = _plan_logits(latent, editor, z_f, K_f, device)
                 base = len(chunk_ids)
                 chunk_ids = chunk_ids + [bundle.mask_id] * K_f
                 chunk_ids, fwd = _fill_plan_block(
-                    editor.mlm_call(), plan, chunk_ids, base, K_f, cfg, device
+                    editor.mlm_call(), plan, chunk_ids, base, K_f, cfg, device, plan_w
                 )
                 forwards += fwd
                 prev_fine = torch.cat([prev_fine, codes_f.unsqueeze(0)], dim=1)
@@ -209,7 +227,6 @@ def generate_latent(
                 best_cos, best_try = cos, chunk_ids
             if cos >= cfg.cycle_threshold or stopped:
                 break
-        cfg.plan_weight = plan_weight
         ids = best_try or ids
         coarse_done += 1
 
@@ -219,7 +236,9 @@ def generate_latent(
             txt = bundle.decode(ids[prompt_len:])
             if any(st in txt for st in cfg.stop_texts):
                 break
-        prev_coarse = torch.cat([prev_coarse, codes_c.unsqueeze(0)], dim=1)[:, -cfg.code_history :]
+        prev_coarse = torch.cat([prev_coarse, codes_c.unsqueeze(0)], dim=1)
+        if prev_coarse.shape[1] >= cfg.code_history:
+            prev_coarse = prev_coarse[:, :0]  # window full: next chunk opens a fresh one
 
     seconds = time.perf_counter() - t0
     new_ids = [t for t in ids[prompt_len:] if t not in stop_set]

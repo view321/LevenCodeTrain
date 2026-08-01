@@ -37,7 +37,11 @@ class LevencodeEditor(nn.Module):
         if latent is None and latent_kwargs:
             from ..latent.bundle import LatentBundle
 
-            latent = LatentBundle(latent_dim=latent_kwargs["latent_dim"], student_hidden=backbone.config.hidden_size, **{k: v for k, v in latent_kwargs.items() if k != "latent_dim"})
+            latent = LatentBundle(
+                latent_dim=latent_kwargs.get("latent_dim", backbone.config.hidden_size),
+                student_hidden=backbone.config.hidden_size,
+                **{k: v for k, v in latent_kwargs.items() if k != "latent_dim"},
+            )
         self.latent = latent
 
     @property

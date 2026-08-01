@@ -377,6 +377,37 @@ def test_store_sample_rows(tmp_path):
     assert rows.shape == (1, 8) and rows.dtype == torch.float32
 
 
+def test_predict_codes_cond_sees_sampled_b2():
+    """Regression: inference conds must come from a pass where BOTH sampled
+    books are in the sequence — they were read before b2 was written, so the
+    residual/energy conditioning saw the zero-code placeholder."""
+    torch.manual_seed(0)
+    lb = _make_bundle()
+    lb.eval()
+    ctx = torch.randn(1, 16)
+    prev = torch.zeros(1, 0, 2, dtype=torch.long)
+    codes, cond = lb.predict_coarse_codes(ctx, prev, temperature=0.0, top_p=1.0)
+    # a manual teacher-forced pass with the returned codes must reproduce cond
+    out = lb.heads.coarse(ctx, codes.unsqueeze(0), torch.ones(1, 1))
+    assert torch.allclose(cond, out["conds"][0, 0], atol=1e-5)
+
+
+def test_decodability_batch_respects_n_chunks(tmp_path):
+    """Regression: the trainer oversamples idxs 4x to survive empty rows; the
+    store must cap the batch at n_chunks instead of returning 4x rows."""
+    exs = [
+        LatentExample(
+            ctx_ids=[1], fine_spans=[(1, 3)], coarse_of_fine=[0],
+            fine_tokens=[[7, 8]], z_fine=torch.randn(1, 8), z_coarse=torch.randn(1, 8),
+        )
+        for _ in range(6)
+    ]
+    store = PrecomputedLatents(tmp_path / "cap")
+    store.write(exs, {"latent_dim": 8, "teacher": "t"})
+    d = store.decodability_batch(list(range(6)), chunk_tokens=4, n_chunks=2, seed=0)
+    assert d["z"].shape[0] == 2 and d["tokens"].shape[0] == 2
+
+
 # ---------- sampler ----------
 
 class FakeEditor:

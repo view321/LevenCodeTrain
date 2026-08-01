@@ -55,15 +55,18 @@ def _boundary_scores(ids: list[int], text: str, bundle) -> list[float]:
     def word(s: str) -> str:
         return s.strip().lstrip(" \t\n\r\"'([{`*")
 
-    toks = [bundle.decode([t]) if bundle else t for t in ids]
+    toks = [bundle.decode([t]) if bundle else str(t) for t in ids]
     n = len(ids)
     scores = [0.0] * (n + 1)
     for i in range(1, n):
-        cur, prev = word(toks[i]), word(toks[i - 1])
+        raw_prev = toks[i - 1]
+        cur, prev = word(toks[i]), word(raw_prev)
         if not cur and not prev:
             continue
         s = 0.0
-        if prev and prev.endswith("\n"):
+        # newline check on the RAW token: word() strips trailing newlines, so
+        # testing the stripped form can never fire
+        if raw_prev.rstrip(" \t").endswith("\n"):
             s += 2.0
         if prev and prev.endswith(("}", ")", "]")):
             s += 1.5
@@ -71,7 +74,9 @@ def _boundary_scores(ids: list[int], text: str, bundle) -> list[float]:
             s += 1.0
         if not prev:
             s += 1.0  # previous token was pure whitespace
-        if cur and (cur[0].isupper() or cur.startswith(("def ", "class ", "import ", "from ", "@"))):
+        # single decoded tokens are bare words — "def " with a trailing space
+        # never matches one
+        if cur and (cur[0].isupper() or cur in ("def", "class", "import", "from") or cur.startswith("@")):
             s += 0.5
         scores[i] = s
     return scores
@@ -136,7 +141,10 @@ def hierarchical_spans(
         total = 0
         target = lv.tokens_per_chunk
         for s, e in spans:
-            if cur and total >= target and (total + (e - s)) > lv.max_tokens:
+            # close the group at the target size OR when adding the next fine
+            # chunk would blow past max_tokens ("and" made target a floor and
+            # max the only real trigger, giving chunks up to 2x the target)
+            if cur and (total >= target or (total + (e - s)) > lv.max_tokens):
                 grouped.append((cur[0][0], cur[-1][1]))
                 cur, total = [], 0
             cur.append((s, e))

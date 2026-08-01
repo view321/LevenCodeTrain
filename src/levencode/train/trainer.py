@@ -135,6 +135,13 @@ class Trainer:
                 raise FileNotFoundError(
                     f"latent store {store_path!r} not found — run scripts/precompute_latents.py first"
                 )
+            man_dim = int(self.store.manifest().get("latent_dim", 0))
+            if man_dim and man_dim != int(self.editor.latent.rvq.dim):
+                raise ValueError(
+                    f"latent store was precomputed with latent_dim={man_dim} but the config builds "
+                    f"the bundle with latent.latent_dim={self.editor.latent.rvq.dim} — "
+                    "re-run precompute or fix the config"
+                )
             # RVQ EMA warm-up on stored teacher latents: the codebooks start as
             # random unit-sphere directions, and the AR priors/energy heads
             # would otherwise spend the first few hundred steps chasing a

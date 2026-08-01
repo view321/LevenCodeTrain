@@ -530,17 +530,25 @@ def _latent_teacher_force(
     def ctx_embed(ids):
         from ..latent.sampler import _ctx_embed
 
-        return _ctx_embed(latent, ctx.editor, ids, ctx.device)
+        return _ctx_embed(latent, ctx.editor, ids, ctx.device, cfg.ctx_len)
 
     from ..latent.sampler import _plan_logits
 
+    # mirror generate_latent's conditioning: coarse ctx pinned at the code
+    # window's start, fine ctx pinned at the coarse chunk's start (training
+    # never advances the pooled ctx inside a window / fine sequence)
+    window_emb = fine_emb = None
     for ci, chunk in enumerate(gold_chunks):
-        emb = ctx_embed(ctx_ids)
         if ci % fpc == 0:
-            z_c, codes_c = latent.predict_coarse_latent(emb, prev_coarse, cfg.__dict__)
-            prev_coarse = torch.cat([prev_coarse, codes_c.unsqueeze(0)], dim=1)[:, -cfg.code_history :]
+            if prev_coarse.shape[1] >= cfg.code_history:
+                prev_coarse = prev_coarse[:, :0]
+            fine_emb = ctx_embed(ctx_ids)
+            if prev_coarse.shape[1] == 0:
+                window_emb = fine_emb
+            z_c, codes_c = latent.predict_coarse_latent(window_emb, prev_coarse, cfg.__dict__)
+            prev_coarse = torch.cat([prev_coarse, codes_c.unsqueeze(0)], dim=1)
             prev_fine = torch.zeros(1, 0, 2, dtype=torch.long, device=ctx.device)
-        z_f, codes_f = latent.predict_fine_latent(emb, codes_c, prev_fine, cfg.__dict__)
+        z_f, codes_f = latent.predict_fine_latent(fine_emb, codes_c, prev_fine, cfg.__dict__)
         plan_logits.append(_plan_logits(latent, ctx.editor, z_f, k, ctx.device))
         prev_fine = torch.cat([prev_fine, codes_f.unsqueeze(0)], dim=1)
         ctx_ids = ctx_ids + chunk

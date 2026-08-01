@@ -184,6 +184,7 @@ latent_sampler:
   cycle_threshold: 0.75
   cycle_retries: 2
   max_total_len: 4096
+  ctx_len: 192               # student ctx pooling window — keep = latent.ctx_len
 
 bench:
   at_stage_end: true

@@ -119,6 +119,8 @@ class PrecomputedLatents:
 
     def __init__(self, root: str | Path):
         self.root = Path(root)
+        self._rows_cache: list[dict] | None = None
+        self._maps: dict[str, np.ndarray] = {}
 
     def exists(self) -> bool:
         return (self.root / "manifest.json").exists()
@@ -160,21 +162,31 @@ class PrecomputedLatents:
         )
         manifest.update({"n_samples": len(rows), "n_fine": n_fine, "n_coarse": n_coarse})
         (self.root / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        self._rows_cache = None  # a reused instance must re-read what it just wrote
+        self._maps = {}
 
     def _rows(self) -> list[dict]:
-        lines = (self.root / "samples.jsonl").read_text(encoding="utf-8").splitlines()
-        return [json.loads(l) for l in lines if l.strip()]
+        # cached: the trainer calls batch() every micro-batch, and re-parsing a
+        # 12k-line jsonl per call would dominate the step time
+        if self._rows_cache is None:
+            lines = (self.root / "samples.jsonl").read_text(encoding="utf-8").splitlines()
+            self._rows_cache = [json.loads(l) for l in lines if l.strip()]
+        return self._rows_cache
+
+    def _memmap(self, kind: str) -> np.ndarray:
+        if kind not in self._maps:
+            name = "z_fine.raw" if kind == "fine" else "z_coarse.raw"
+            self._maps[kind] = np.load(self.root / name, mmap_mode="r")
+        return self._maps[kind]
 
     def latents(self, kind: str, device) -> torch.Tensor:
-        path = self.root / ("z_fine.raw" if kind == "fine" else "z_coarse.raw")
-        m = np.load(path, mmap_mode="r")
-        return torch.from_numpy(m.astype("float32")).to(device)
+        return torch.from_numpy(self._memmap(kind).astype("float32")).to(device)
 
     def sample(self, idx: int) -> LatentExample:
         """Return one stored example with its latents (float32, device-agnostic)."""
         r = self._rows()[idx]
-        zf = torch.from_numpy(np.load(self.root / "z_fine.raw", mmap_mode="r")[r["f_off"] : r["f_off"] + r["n_fine"]].astype("float32"))
-        zc = torch.from_numpy(np.load(self.root / "z_coarse.raw", mmap_mode="r")[r["c_off"] : r["c_off"] + r["n_coarse"]].astype("float32"))
+        zf = torch.from_numpy(self._memmap("fine")[r["f_off"] : r["f_off"] + r["n_fine"]].astype("float32"))
+        zc = torch.from_numpy(self._memmap("coarse")[r["c_off"] : r["c_off"] + r["n_coarse"]].astype("float32"))
         return LatentExample(
             ctx_ids=r["ctx_ids"],
             fine_spans=[],
@@ -196,8 +208,8 @@ class PrecomputedLatents:
 
         rng = random.Random(seed)
         rows = self._rows()
-        zf_m = np.load(self.root / "z_fine.raw", mmap_mode="r")
-        zc_m = np.load(self.root / "z_coarse.raw", mmap_mode="r")
+        zf_m = self._memmap("fine")
+        zc_m = self._memmap("coarse")
         ctx_rows, coarse_zs, fine_zs, cond_zs = [], [], [], []
         coarse_mask, fine_mask = [], []
         coarse_lens = []
@@ -262,9 +274,11 @@ class PrecomputedLatents:
 
         rng = random.Random(seed)
         rows = self._rows()
-        zf_m = np.load(self.root / "z_fine.raw", mmap_mode="r")
+        zf_m = self._memmap("fine")
         zs, tss = [], []
         for i in idxs:
+            if len(zs) >= n_chunks:
+                break  # callers oversample idxs to survive empty rows
             r = rows[i]
             if not r["fine_tokens"]:
                 continue
@@ -284,7 +298,7 @@ class PrecomputedLatents:
     def sample_rows(self, kind: str, n: int, seed: int = 0) -> torch.Tensor:
         """Random rows from a latent memmap without materializing the whole
         store (used for the RVQ EMA warm-up at trainer init)."""
-        m = np.load(self.root / ("z_fine.raw" if kind == "fine" else "z_coarse.raw"), mmap_mode="r")
+        m = self._memmap(kind)
         rng = np.random.default_rng(seed)
         idx = rng.choice(m.shape[0], size=min(n, m.shape[0]), replace=False)
         idx.sort()

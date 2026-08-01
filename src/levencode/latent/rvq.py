@@ -80,14 +80,25 @@ class RVQ(nn.Module):
             self.ema_count[b].mul_(decay).add_(count, alpha=1 - decay)
             self.ema_sum[b].mul_(decay).add_(summed, alpha=1 - decay)
         else:
+            # first batch: overwrite only rows that won an assignment; zeroing
+            # the rest (old behavior) parked every unused code at the origin
+            assigned = count > 0
             self.ema_count[b] = count
-            self.ema_sum[b] = summed
+            self.ema_sum[b] = torch.where(assigned.unsqueeze(-1), summed, self.codebooks[b])
             self.initialized[b] = True
         cnt = self.ema_count[b].clamp_min(1.0)
         self.codebooks[b] = self.ema_sum[b] / cnt.unsqueeze(-1)
-        # dedup: collapsed codebooks get re-initialized from the mean
-        if torch.unique(self.codebooks[b], dim=0).shape[0] < self.codebook_size:
-            self.codebooks[b].add_(torch.randn_like(self.codebooks[b]) * self.dim**-0.5)
+        # dead-code revival: re-seed only codes whose EMA usage decayed to ~0
+        # from random batch vectors. (The old dedup jolted the ENTIRE codebook
+        # with unit-norm noise whenever any two rows collided — destroying the
+        # live codes — and paid an O(C^2 d) torch.unique per update for it.)
+        dead = self.ema_count[b] < 1e-2
+        if dead.any():
+            k = int(dead.sum())
+            src = residual[torch.randint(0, residual.shape[0], (k,), device=residual.device)]
+            self.codebooks[b][dead] = src
+            self.ema_sum[b][dead] = src
+            self.ema_count[b][dead] = 1.0
 
     @torch.no_grad()
     def quantize_codes(self, codes: torch.Tensor) -> torch.Tensor:

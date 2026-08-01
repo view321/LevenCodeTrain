@@ -89,7 +89,7 @@ class LatentBundle(nn.Module):
     # ---------- training steps ----------
 
     def _level_losses(
-        self, level: nn.Module, head: torch.Tensor, z: torch.Tensor, mask: torch.Tensor, ctx_embed: torch.Tensor
+        self, level: nn.Module, head: torch.Tensor, z: torch.Tensor, mask: torch.Tensor
     ) -> dict:
         """Shared body for coarse/fine: quantize -> AR codes -> residual -> scorer.
 
@@ -123,7 +123,14 @@ class LatentBundle(nn.Module):
         drop = torch.rand(len(r), device=z.device) < self.cfg_dropout
         zp = zf[m].detach()
         e_pos = level.energy(conds, zp, dropped=drop)
-        perm = torch.randperm(len(r), device=z.device)
+        # fixed-point-free shuffle: randperm can map i -> i, ranking a latent
+        # against itself (constant-margin loss, zero gradient)
+        n_rows = len(r)
+        if n_rows > 1:
+            shift = int(torch.randint(1, n_rows, (1,)).item())
+            perm = (torch.arange(n_rows, device=z.device) + shift) % n_rows
+        else:
+            perm = torch.zeros(1, dtype=torch.long, device=z.device)
         e_neg = level.energy(conds, zp[perm], dropped=drop)
         keep = ~drop
         sc_terms = []
@@ -165,7 +172,7 @@ class LatentBundle(nn.Module):
         # coarse level: one AR sequence per sample over a window of chunks
         z_c = batch["z_coarse"]  # [B, W, D]
         c_mask = batch["coarse_mask"]
-        coarse = self._level_losses(self.heads.coarse, ctx_embed, z_c, c_mask, ctx_embed)
+        coarse = self._level_losses(self.heads.coarse, ctx_embed, z_c, c_mask)
 
         # fine level: per-row one coarse chunk; cond = quantized coarse latent
         z_f = batch["z_fine"]  # [B, Wf, D]
@@ -173,7 +180,7 @@ class LatentBundle(nn.Module):
         z_cond = batch["z_coarse_cond"]  # [B, D] teacher latent of the cond chunk
         zq_cond = self.rvq.quantize(z_cond, update=False)[0]
         fine_head = ctx_embed + self.heads.coarse_cond_proj(zq_cond)
-        fine = self._level_losses(self.heads.fine, fine_head, z_f, f_mask, ctx_embed)
+        fine = self._level_losses(self.heads.fine, fine_head, z_f, f_mask)
 
         out = {
             "coarse_ce": coarse["ce"],
@@ -222,81 +229,78 @@ class LatentBundle(nn.Module):
     # ---------- inference helpers ----------
 
     @torch.no_grad()
-    def predict_coarse_codes(
-        self, ctx_embed: torch.Tensor, prev_codes: torch.Tensor, temperature: float, top_p: float
+    def _predict_codes(
+        self, level: nn.Module, head: torch.Tensor, prev_codes: torch.Tensor, temperature: float, top_p: float
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sample the next coarse chunk's plan codes (discrete anchor, cheap
-        temperature). prev_codes [B, T, 2] or empty; returns (codes [B, 2],
-        cond [B, ar_dim])."""
+        """Sample the next chunk's plan codes. prev_codes [B, T, 2] or empty;
+        returns (codes [B, 2], cond [B, ar_dim])."""
         from ..sampling.block_sampler import pick_token
 
         T = prev_codes.shape[1]
-        codes = torch.zeros(1, T + 1, 2, dtype=torch.long, device=ctx_embed.device)
+        codes = torch.zeros(1, T + 1, 2, dtype=torch.long, device=head.device)
         codes[:, :T] = prev_codes
-        out = self.heads.coarse(ctx_embed, codes, torch.ones(1, T + 1, device=ctx_embed.device))
-        l1, l2 = out["b1_logits"][0, T], out["b2_logits"][0, T]
-        b1, _ = pick_token(l1.unsqueeze(0), temperature, top_p, None)
+        ones = torch.ones(1, T + 1, device=head.device)
+        out = level(head, codes, ones)
+        b1, _ = pick_token(out["b1_logits"][0, T].unsqueeze(0), temperature, top_p, None)
         codes[:, T, 0] = b1
-        out2 = self.heads.coarse(ctx_embed, codes, torch.ones(1, T + 1, device=ctx_embed.device))
-        l2b = out2["b2_logits"][0, T]
-        b2, _ = pick_token(l2b.unsqueeze(0), temperature, top_p, None)
+        out = level(head, codes, ones)
+        b2, _ = pick_token(out["b2_logits"][0, T].unsqueeze(0), temperature, top_p, None)
         codes[:, T, 1] = b2
-        cond = out2["conds"][0, T]
-        return codes[:, T], cond
+        # conds must see BOTH sampled books: training reads them after b2_j
+        # (test_conds_are_after_b2), so reading from the pass above would
+        # condition the residual/energy on the zero placeholder in b2's slot
+        out = level(head, codes, ones)
+        return codes[:, T], out["conds"][0, T]
 
     @torch.no_grad()
-    def predict_coarse_latent(self, ctx_embed: torch.Tensor, prev_codes: torch.Tensor, cfg: dict) -> torch.Tensor:
-        """Full coarse latent z = z_q + r via CFG-scored residual candidates."""
+    def _guided_latent(self, level: nn.Module, cond: torch.Tensor, codes: torch.Tensor, cfg: dict) -> torch.Tensor:
+        """Full latent z = z_q + r via CFG-scored residual candidates."""
+        zq = self.rvq.quantize_codes(codes.unsqueeze(0))[0]
+        n = int(cfg.get("residual_candidates", 8))
+        cand = level.residual.sample(cond.unsqueeze(0), n)[0]  # [n, D]
+        z_cand = zq + cand
+        w = float(cfg.get("cfg_weight", 1.0))
+        e_cond = level.energy(cond.unsqueeze(0).expand(n, -1), z_cand)
+        e_null = level.energy(
+            torch.zeros_like(cond).unsqueeze(0).expand(n, -1), z_cand,
+            dropped=torch.ones(n, dtype=torch.bool, device=cond.device),
+        )
+        score = (1 + w) * e_cond - w * e_null
+        return (zq + cand[score.argmin()])[0]
+
+    @torch.no_grad()
+    def predict_coarse_codes(
+        self, ctx_embed: torch.Tensor, prev_codes: torch.Tensor, temperature: float, top_p: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._predict_codes(self.heads.coarse, ctx_embed, prev_codes, temperature, top_p)
+
+    @torch.no_grad()
+    def predict_coarse_latent(
+        self, ctx_embed: torch.Tensor, prev_codes: torch.Tensor, cfg: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         codes, cond = self.predict_coarse_codes(
             ctx_embed, prev_codes, float(cfg.get("plan_temperature", 0.8)), float(cfg.get("plan_top_p", 0.9))
         )
-        zq = self.rvq.quantize_codes(codes.unsqueeze(0))[0]
-        n = int(cfg.get("residual_candidates", 8))
-        cand = self.heads.coarse.residual.sample(cond.unsqueeze(0), n)[0]  # [n, D]
-        z_cand = zq + cand
-        w = float(cfg.get("cfg_weight", 1.0))
-        e_cond = self.heads.coarse.energy(cond.unsqueeze(0).expand(n, -1), z_cand)
-        e_null = self.heads.coarse.energy(
-            torch.zeros_like(cond).unsqueeze(0).expand(n, -1), z_cand, dropped=torch.ones(n, dtype=torch.bool, device=cond.device)
-        )
-        score = (1 + w) * e_cond - w * e_null
-        best = score.argmin()
-        return (zq + cand[best])[0], codes
+        return self._guided_latent(self.heads.coarse, cond, codes, cfg), codes
+
+    def _fine_head(self, ctx_embed: torch.Tensor, coarse_codes: torch.Tensor) -> torch.Tensor:
+        zq_c = self.rvq.quantize_codes(coarse_codes.unsqueeze(0))[0]
+        return ctx_embed + self.heads.coarse_cond_proj(zq_c)
 
     @torch.no_grad()
     def predict_fine_codes(
         self, ctx_embed: torch.Tensor, coarse_codes: torch.Tensor, prev_fine_codes: torch.Tensor, temperature: float, top_p: float
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Next fine chunk's codes, conditioned on the coarse plan chunk."""
-        from ..sampling.block_sampler import pick_token
-
-        zq_c = self.rvq.quantize_codes(coarse_codes.unsqueeze(0))[0]
-        head = ctx_embed + self.heads.coarse_cond_proj(zq_c)
-        T = prev_fine_codes.shape[1]
-        codes = torch.zeros(1, T + 1, 2, dtype=torch.long, device=ctx_embed.device)
-        codes[:, :T] = prev_fine_codes
-        out = self.heads.fine(head, codes, torch.ones(1, T + 1, device=ctx_embed.device))
-        b1, _ = pick_token(out["b1_logits"][0, T].unsqueeze(0), temperature, top_p, None)
-        codes[:, T, 0] = b1
-        out2 = self.heads.fine(head, codes, torch.ones(1, T + 1, device=ctx_embed.device))
-        b2, _ = pick_token(out2["b2_logits"][0, T].unsqueeze(0), temperature, top_p, None)
-        codes[:, T, 1] = b2
-        return codes[:, T], out2["conds"][0, T]
+        head = self._fine_head(ctx_embed, coarse_codes)
+        return self._predict_codes(self.heads.fine, head, prev_fine_codes, temperature, top_p)
 
     @torch.no_grad()
-    def predict_fine_latent(self, ctx_embed: torch.Tensor, coarse_codes: torch.Tensor, prev_fine_codes: torch.Tensor, cfg: dict) -> torch.Tensor:
+    def predict_fine_latent(
+        self, ctx_embed: torch.Tensor, coarse_codes: torch.Tensor, prev_fine_codes: torch.Tensor, cfg: dict
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         codes, cond = self.predict_fine_codes(
             ctx_embed, coarse_codes, prev_fine_codes,
             float(cfg.get("plan_temperature", 0.8)), float(cfg.get("plan_top_p", 0.9)),
         )
-        zq = self.rvq.quantize_codes(codes.unsqueeze(0))[0]
-        n = int(cfg.get("residual_candidates", 8))
-        cand = self.heads.fine.residual.sample(cond.unsqueeze(0), n)[0]
-        z_cand = zq + cand
-        w = float(cfg.get("cfg_weight", 1.0))
-        e_cond = self.heads.fine.energy(cond.unsqueeze(0).expand(n, -1), z_cand)
-        e_null = self.heads.fine.energy(
-            torch.zeros_like(cond).unsqueeze(0).expand(n, -1), z_cand, dropped=torch.ones(n, dtype=torch.bool, device=cond.device)
-        )
-        score = (1 + w) * e_cond - w * e_null
-        return (zq + cand[score.argmin()])[0], codes
+        return self._guided_latent(self.heads.fine, cond, codes, cfg), codes

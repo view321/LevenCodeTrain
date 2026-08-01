@@ -59,9 +59,18 @@ def main() -> None:
     teacher_repo = cfg_get(cfg, "latent.teacher")
     out_dir = args.out or cfg_get(cfg, "latent.store")
     levels_cfg = cfg_get(cfg, "latent.levels", None)
-    spec = HierarchicalSpec(
-        levels=[LevelSpec(name="coarse", tokens_per_chunk=32), LevelSpec(name="fine", tokens_per_chunk=8)]
-    )
+    if levels_cfg:
+        spec = HierarchicalSpec.from_dict({"levels": levels_cfg})
+    else:
+        # defaults need explicit min/max: LevelSpec's dataclass defaults
+        # (min 4 / max 16) are fine-level numbers, and a coarse target of 32
+        # with max_tokens=16 degenerates the grouping logic
+        spec = HierarchicalSpec(
+            levels=[
+                LevelSpec(name="coarse", tokens_per_chunk=32, min_tokens=16, max_tokens=64),
+                LevelSpec(name="fine", tokens_per_chunk=8, min_tokens=4, max_tokens=16),
+            ]
+        )
 
     device = torch.device(args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu"))
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
@@ -155,8 +164,13 @@ def main() -> None:
         "teacher": teacher_repo,
         "latent_dim": int(model.config.hidden_size),
         "levels": [
-            {"name": "coarse", "tokens_per_chunk": 32},
-            {"name": "fine", "tokens_per_chunk": 8},
+            {
+                "name": lv.name,
+                "tokens_per_chunk": lv.tokens_per_chunk,
+                "min_tokens": lv.min_tokens,
+                "max_tokens": lv.max_tokens,
+            }
+            for lv in spec.levels
         ],
         "pool": extractor.pool,
         "dropout_tokens": extractor.dropout_tokens,
