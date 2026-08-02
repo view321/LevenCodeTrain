@@ -38,6 +38,51 @@ from .config import LoomConfig
 from .layers import DenseBlock, MoEBlock, RMSNorm, build_rope_cache
 
 
+def _ce_sum(logits: torch.Tensor, labels: torch.Tensor, ignore_index: int) -> torch.Tensor:
+    """Summed CE over one chunk; the fp32 cast lives and dies inside here."""
+    return F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]).float(),
+        labels.reshape(-1),
+        ignore_index=ignore_index,
+        reduction="sum",
+    )
+
+
+def shifted_cross_entropy(
+    logits: torch.Tensor,   # [B, T, V]
+    labels: torch.Tensor,   # [B, T]
+    ignore_index: int = -100,
+    chunks: int = 1,
+) -> torch.Tensor:
+    """Next-token CE (logits[:, :-1] predicts labels[:, 1:]) computed in
+    row-chunks to keep the fp32 logit copy small.
+
+    Chunking ALONE saves nothing — every chunk's cast and log_softmax would
+    survive until backward — so each chunk is wrapped in `checkpoint` and
+    recomputed. Peak becomes one chunk's worth instead of the whole batch's.
+    Summing then dividing by the valid-token count is exactly `reduction=
+    "mean"` with `ignore_index`, and accumulating in fp32 across chunks is if
+    anything better conditioned than one big reduction.
+    """
+    B, V = logits.shape[0], logits.shape[-1]
+    lg_all, lb_all = logits[:, :-1], labels[:, 1:]
+    if chunks <= 1:
+        return F.cross_entropy(
+            lg_all.reshape(-1, V).float(), lb_all.reshape(-1), ignore_index=ignore_index
+        )
+    n_valid = (lb_all != ignore_index).sum().clamp_min(1)
+    size = max((B + chunks - 1) // chunks, 1)
+    total = None
+    for i in range(0, B, size):
+        lg, lb = lg_all[i : i + size], lb_all[i : i + size]
+        if torch.is_grad_enabled() and lg.requires_grad:
+            part = checkpoint(_ce_sum, lg, lb, ignore_index, use_reentrant=False)
+        else:
+            part = _ce_sum(lg, lb, ignore_index)
+        total = part if total is None else total + part
+    return total / n_valid
+
+
 def _rms(x: torch.Tensor) -> torch.Tensor:
     """Per-token RMS of the residual stream, detached — the unit that
     conditioning terms are expressed in so they stay trainable as the stream
@@ -198,11 +243,7 @@ class LoomLM(nn.Module):
             **film_stats,
         }
         if labels is not None:
-            ce = F.cross_entropy(
-                logits[:, :-1].reshape(-1, cfg.vocab_size).float(),
-                labels[:, 1:].reshape(-1),
-                ignore_index=-100,
-            )
+            ce = shifted_cross_entropy(logits, labels, chunks=cfg.ce_chunks)
             out["ce"] = ce
             out["loss"] = ce + cfg.router_aux_weight * aux_lb + cfg.router_z_weight * aux_z
         return out

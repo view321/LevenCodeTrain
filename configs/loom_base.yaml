@@ -31,6 +31,9 @@ loom:
   # per-loop RMSNorm gain deltas + router logit bias (scale-free depth
   # conditioning); the additive loop_emb alone measured vestigial at 2.6B tok
   per_loop_cond: true
+  # row-chunks for the CE loss; raise to cut peak VRAM, lower for less
+  # recompute. 1 = one unchunked fp32 call (~8.6GB at micro_bs 16, seq 1024)
+  ce_chunks: 8
   segment_len: 32
   concept_layers: 4
   concept_heads: 8

@@ -15,6 +15,20 @@ const COMPONENTS = [
   ["ce", 7, "raw CE"],
 ];
 
+// Conditioning-health series. Every one of these starts at (or near) zero and
+// only matters if it climbs: they are the pathways that can silently stay
+// inert. Loom run 1 shipped a `loop_emb` that never left init scale — the
+// whole point of this panel is that such a no-op is visible in the first hour
+// rather than inferred from a null bench 30h later. Shared axis is fine:
+// they are all small fractions by construction.
+const COND_SERIES = [
+  ["cond_gain_frac", 1, "per-loop norm gain"],
+  ["cond_router_bias", 2, "per-loop router bias"],
+  ["loop_emb_frac", 3, "loop_emb / stream RMS"],
+  ["beta_frac", 4, "FiLM beta / stream RMS"],
+  ["gamma_rms", 5, "FiLM gamma RMS"],
+];
+
 const BENCH_METRICS = [
   { label: "chat masked CE", task: "chat", key: "chat_masked_ce", dir: "down", fmt: f3 },
   { label: "ARC-Easy acc", task: "arc_easy", key: "arc_easy_acc", dir: "up", fmt: pct },
@@ -36,8 +50,8 @@ const state = {
   focus: null,
   logY: false,
   smooth: true,
-  hidden: { loss: new Set(), comp: new Set() },
-  asTable: { loss: false, comp: false, speed: false },
+  hidden: { loss: new Set(), comp: new Set(), cond: new Set() },
+  asTable: { loss: false, comp: false, speed: false, cond: false },
   metrics: {}, // stage -> rows
   bench: {},   // stage -> {name: results}
   samples: {},
@@ -132,6 +146,7 @@ function render() {
   renderTiles();
   renderLossChart();
   renderCompChart();
+  renderCondChart();
   renderSpeedChart();
   renderBench();
   renderSamples();
@@ -177,6 +192,7 @@ function renderTiles() {
     ["loss", st.last && st.last.loss != null ? fmtVal(st.last.loss) : "—", ""],
     ["masked CE", st.last && st.last.ce != null ? fmtVal(st.last.ce) : "—", "window avg"],
     ["tokens/sec", fmtK(st.tok_per_sec), ""],
+    ["vram", st.last && st.last.vram_gb != null ? `${f1(st.last.vram_gb)}<span class="unit">GB</span>` : "—", "peak alloc"],
     ["lr", st.lr != null ? st.lr.toExponential(1) : "—", ""],
     ["tokens seen", st.last ? fmtK(st.last.tokens_seen) : "—", ""],
   ];
@@ -431,6 +447,45 @@ function renderCompChart() {
   state.asTable.comp ? dataTable(el, shown) : lineChart(el, withSmoothing(shown), {});
 }
 
+// Zero-init pathways: flat at zero means "never engaged", which is a result,
+// not a rendering bug — so say so explicitly instead of drawing an empty box.
+function renderCondChart() {
+  const rows = state.metrics[state.focus] || [];
+  const series = COND_SERIES
+    .map(([key, slot, label]) => ({
+      name: label,
+      color: seriesColor(slot),
+      points: rows.filter((r) => r[key] != null).map((r) => [r.step, r[key]]),
+    }))
+    .filter((s) => s.points.length >= 2);
+  const card = $("#cond-card");
+  if (!series.length) {
+    card.style.display = rows.length ? "" : "none";
+    $("#cond-sub").textContent = state.focus || "";
+    $("#cond-legend").innerHTML = "";
+    $("#cond-chart").innerHTML =
+      `<p class="muted">No conditioning metrics in this run — it predates <code>per_loop_cond</code>.</p>`;
+    return;
+  }
+  card.style.display = "";
+  // "Moved since init", not "nonzero": loop_emb starts at init_std by design,
+  // so a nonzero test would score it as active on step 1 when it is doing
+  // nothing. What matters is whether training has pushed the channel at all.
+  const live = series.filter(
+    (s) => Math.abs(s.points[s.points.length - 1][1] - s.points[0][1]) > 1e-6
+  );
+  $("#cond-sub").textContent =
+    `${state.focus} — ${live.length}/${series.length} moved since init` +
+    (live.length ? "" : " (all pathways inert)");
+  legend($("#cond-legend"), series, state.hidden.cond, (n) => {
+    state.hidden.cond.has(n) ? state.hidden.cond.delete(n) : state.hidden.cond.add(n);
+    renderCondChart();
+  });
+  const shown = series.filter((s) => !state.hidden.cond.has(s.name));
+  const el = $("#cond-chart");
+  state.asTable.cond ? dataTable(el, shown) : lineChart(el, withSmoothing(shown), {});
+}
+
 function renderSpeedChart() {
   const rows = state.metrics[state.focus] || [];
   const series = [{
@@ -533,6 +588,7 @@ $("#smooth-btn").addEventListener("click", () => {
   $("#smooth-btn").setAttribute("aria-pressed", state.smooth);
   renderLossChart();
   renderCompChart();
+  renderCondChart();
 });
 document.querySelectorAll(".table-toggle").forEach((b) =>
   b.addEventListener("click", () => {

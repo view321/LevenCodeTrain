@@ -50,6 +50,13 @@ class LoomConfig:
     # logit space. Defaults False so pre-conditioning checkpoints still load.
     per_loop_cond: bool = False
 
+    # Cross-entropy chunking. A 65k vocab makes the loss, not the activations,
+    # the peak-memory term: `F.cross_entropy(logits.float(), ...)` materializes
+    # N*V in fp32 twice (the cast + log_softmax saved for backward) ~ 8.6GB at
+    # micro_bs 16 / seq 1024. Chunks are recomputed in backward, so peak falls
+    # to one chunk. 1 = single unchunked call (old behaviour).
+    ce_chunks: int = 8
+
     # concept level (LCM-style planner in the model's own hidden space)
     segment_len: int = 32
     concept_layers: int = 4
