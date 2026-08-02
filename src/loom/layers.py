@@ -15,16 +15,29 @@ import torch.nn.functional as F
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
+    """Optionally carries `n_cond` per-condition gain deltas (adaLN-style).
+
+    The delta is added to the gain, which multiplies an already unit-RMS
+    vector — so a delta of 0.1 is 10% of the signal no matter how large the
+    residual stream has grown. That is the whole point: additive conditioning
+    at the loop entry point cannot compete with an RMS-100 stream, gain
+    conditioning always can. Zero-init => exact no-op at step 0.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-5, n_cond: int = 0):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
+        self.cond = nn.Parameter(torch.zeros(n_cond, dim)) if n_cond else None
         self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cond_idx: int | None = None) -> torch.Tensor:
         dt = x.dtype
+        w = self.weight
+        if self.cond is not None and cond_idx is not None:
+            w = w + self.cond[cond_idx]
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x * self.weight.float()).to(dt)
+        return (x * w.float()).to(dt)
 
 
 def build_rope_cache(max_seq: int, head_dim: int, theta: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -110,18 +123,25 @@ class MoELayer(nn.Module):
     """Top-k softmax routing over SwiGLU experts, plus an always-on shared
     expert (DeepSeek-style). Router stays small and trains under AdamW."""
 
-    def __init__(self, d_model: int, n_experts: int, top_k: int, d_ff_expert: int, shared: bool):
+    def __init__(self, d_model: int, n_experts: int, top_k: int, d_ff_expert: int, shared: bool,
+                 n_loops: int = 0):
         super().__init__()
         self.n_experts = n_experts
         self.top_k = top_k
         self.router = nn.Linear(d_model, n_experts, bias=False)
+        # Per-loop logit bias: lets loop r shift its expert preferences without
+        # the state having to encode "which loop am I" first. Acts in logit
+        # space, so it is scale-free like the norm gains. Zero-init = no-op.
+        self.loop_bias = nn.Parameter(torch.zeros(n_loops, n_experts)) if n_loops else None
         self.experts = nn.ModuleList(SwiGLU(d_model, d_ff_expert) for _ in range(n_experts))
         self.shared = SwiGLU(d_model, d_ff_expert) if shared else None
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, dict]:
+    def forward(self, x: torch.Tensor, loop_idx: int | None = None) -> tuple[torch.Tensor, dict]:
         B, T, D = x.shape
         flat = x.reshape(-1, D)
         logits = self.router(flat).float()  # [N, E]
+        if self.loop_bias is not None and loop_idx is not None:
+            logits = logits + self.loop_bias[loop_idx].float()
         probs = logits.softmax(-1)
         top_p, top_i = probs.topk(self.top_k, dim=-1)
         top_p = top_p / top_p.sum(-1, keepdim=True)  # renormalize the chosen k
@@ -162,16 +182,21 @@ class DenseBlock(nn.Module):
 
 
 class MoEBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, n_experts: int, top_k: int, d_ff_expert: int, shared: bool, eps: float):
-        super().__init__()
-        self.attn_norm = RMSNorm(d_model, eps)
-        self.attn = Attention(d_model, n_heads, n_kv_heads)
-        self.ffn_norm = RMSNorm(d_model, eps)
-        self.moe = MoELayer(d_model, n_experts, top_k, d_ff_expert, shared)
+    """The looped core block. `n_loops > 0` enables per-loop conditioning on
+    both norms and the router; `loop_idx=None` at call time falls back to
+    unconditioned behaviour."""
 
-    def forward(self, x, cos, sin, past_kv=None):
-        a, kv = self.attn(self.attn_norm(x), cos, sin, past_kv)
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int, n_experts: int, top_k: int,
+                 d_ff_expert: int, shared: bool, eps: float, n_loops: int = 0):
+        super().__init__()
+        self.attn_norm = RMSNorm(d_model, eps, n_cond=n_loops)
+        self.attn = Attention(d_model, n_heads, n_kv_heads)
+        self.ffn_norm = RMSNorm(d_model, eps, n_cond=n_loops)
+        self.moe = MoELayer(d_model, n_experts, top_k, d_ff_expert, shared, n_loops=n_loops)
+
+    def forward(self, x, cos, sin, past_kv=None, loop_idx=None):
+        a, kv = self.attn(self.attn_norm(x, loop_idx), cos, sin, past_kv)
         x = x + a
-        m, aux = self.moe(self.ffn_norm(x))
+        m, aux = self.moe(self.ffn_norm(x, loop_idx), loop_idx)
         x = x + m
         return x, kv, aux

@@ -42,6 +42,14 @@ class LoomConfig:
     router_aux_weight: float = 0.01
     router_z_weight: float = 1e-3
 
+    # Per-loop depth conditioning. The additive `loop_emb` alone is a dead end:
+    # it enters a residual stream at RMS ~50-100 and cannot bootstrap from
+    # init scale (measured vestigial at 2.6B tokens -- ratio 0.001, dCE
+    # +0.0001). These channels are scale-free instead: per-loop RMSNorm gain
+    # deltas multiply a unit-RMS vector, and the router bias acts directly in
+    # logit space. Defaults False so pre-conditioning checkpoints still load.
+    per_loop_cond: bool = False
+
     # concept level (LCM-style planner in the model's own hidden space)
     segment_len: int = 32
     concept_layers: int = 4
@@ -83,5 +91,5 @@ class LoomConfig:
             prelude_layers=1, core_layers=2, coda_layers=1, n_loops=2,
             d_ff_dense=64, n_experts=4, top_k=2, d_ff_expert=32,
             max_seq_len=64, segment_len=4, concept_layers=2, concept_heads=2,
-            concept_ff=64,
+            concept_ff=64, per_loop_cond=True,
         )

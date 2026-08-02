@@ -103,15 +103,23 @@ def main() -> None:
     d = ce_off - ce_on
     print(f"\n  held-out CE  intact={ce_on:.4f}  zeroed={ce_off:.4f}  delta={d:+.4f} nats"
           f"  ({100 * d / max(ce_on, 1e-9):+.2f}%)")
-    print(
-        "  VERDICT: " + (
-            "loop_emb is vestigial -- the loops differentiate from state alone, "
-            "explicit depth conditioning is not carrying the staging"
-            if abs(d) < 0.01 else
-            "loop_emb matters functionally even though it barely moves routing -- "
-            "it is acting somewhere other than the router"
+    ratios = [float(emb[r].pow(2).mean().sqrt()) / max(per_loop_adapter[r], 1e-9) for r in range(R)]
+    drowned = max(ratios) < 0.01
+    if abs(d) < 0.01 and drowned:
+        verdict = (
+            f"loop_emb is inert AND drowned (max ratio {max(ratios):.4f}): it sits ~"
+            f"{1 / max(max(ratios), 1e-9):.0f}x below the signal it is added to, so its own "
+            "gradient cannot bootstrap it. This says the depth tag was never operative -- NOT "
+            "that depth conditioning is unnecessary. Any other fixed-scale additive injection "
+            "at this site (e.g. FiLM beta) has the same problem."
         )
-    )
+    elif abs(d) < 0.01:
+        verdict = ("loop_emb is inert despite being at a workable scale -- the loops really do "
+                   "differentiate from state alone")
+    else:
+        verdict = ("loop_emb matters functionally even though it barely moves routing -- "
+                   "it is acting somewhere other than the router")
+    print(f"  VERDICT: {verdict}")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,9 @@ loom:
   top_k: 2
   d_ff_expert: 1024
   shared_expert: true
+  # per-loop RMSNorm gain deltas + router logit bias (scale-free depth
+  # conditioning); the additive loop_emb alone measured vestigial at 2.6B tok
+  per_loop_cond: true
   segment_len: 32
   concept_layers: 4
   concept_heads: 8

@@ -5,10 +5,10 @@ A from-scratch LM combining three ideas, sized for a single RTX 5090 and a
 similar compute:
 
 1. **Looped MoE core** (weight reuse): prelude (2 dense layers) → core
-   (4 MoE layers applied R=3 times, Huginn-style input injection + per-loop
-   embeddings) → coda (2 dense layers). Effective depth 16 from 8 layers'
-   worth of unique weights; ~285M total params, ~262M active-equivalent
-   compute per token (incl. tied head).
+   (4 MoE layers applied R=3 times, Huginn-style input injection + scale-free
+   per-loop conditioning) → coda (2 dense layers). Effective depth 16 from 8
+   layers' worth of unique weights; ~294M total params, ~263M
+   active-equivalent compute per token (incl. tied head).
 2. **Token-level autoregression** with plain cross-entropy. The Levencode
    stage-5 postmortem's central lesson: keep the densest, best-conditioned
    training signal at the fine level; do not generate through latents.
@@ -28,6 +28,26 @@ similar compute:
 | 8-token canvases were OOD for the filler | No canvases: token AR all the way down; concepts change *computation*, not the output space |
 | Plan prior conditioned on one pooled ctx vector, never beat chance | Predictor attends over the full concept sequence; phase-2 ablations gate whether it earns its keep |
 | RVQ/energy/CFG machinery = many links that can silently fail | Regression-only concept loss (guidance tolerates mean-regression); each phase benches against the previous |
+
+## Run 1 postmortem (2.6B tokens) → run 2 changes
+
+Routing analysis on `step_30000` (`scripts/loom_routing.py`) showed the loops
+run as a **staged pipeline, not repeated identical computation**: router
+entropy falls monotonically with loop index (~2.95 → ~2.7 → ~1.1-1.9 bits of
+3.0) in every core layer on every corpus, cross-loop usage JS exceeds
+cross-domain JS (0.054 vs 0.032 bits, null 0.00002), and at core layer 3 loops
+0 and 2 route independently (kappa +0.02). That happened *despite* depth
+conditioning being broken, not because of it.
+
+`scripts/loom_loopemb.py` found `loop_emb` vestigial: RMS 0.046-0.074 against
+an adapter output at RMS 48.8-102.9 (ratio 0.001), zeroing it costs +0.0001
+nats. It is not that the model didn't need a depth tag — the tag was never
+operative, because a fixed-scale additive term cannot bootstrap against a
+stream three orders of magnitude larger. Run 2 therefore makes every
+conditioning channel scale-relative (`per_loop_cond`, `_rms`-scaled `loop_emb`
+and FiLM beta) and logs `cond_gain_frac` / `cond_router_bias` /
+`loop_emb_frac` / `beta_frac` so inertness is visible live rather than
+inferred from a null bench.
 
 ## Training phases (planned)
 

@@ -3,12 +3,20 @@
 Loop recipe (Huginn-style recurrent depth, fixed R):
     e   = prelude(embed(ids))            # token embedding enriched once
     s_0 = e
-    s_{r+1} = core( adapter([s_r ; e]) + loop_emb_r , modulated by FiLM(c) )
+    u_r = adapter([s_r ; e]) + loop_emb_r * rms(u)      # depth tag, scale-free
+    s_{r+1} = core_r( u_r modulated by FiLM(c) )        # core_r: per-loop gains
     logits  = lm_head(norm(coda(s_R)))
 
 - The adapter re-injects e every loop so the state cannot drift away from the
-  token evidence; per-loop embeddings tell the shared weights which iteration
-  they are running.
+  token evidence.
+- Depth conditioning is scale-relative everywhere. The first run's fixed-scale
+  `loop_emb` measured vestigial (RMS 0.05 against an adapter output at RMS
+  48-103, ratio 0.001, dCE +0.0001 at 2.6B tokens): its gradient is
+  proportional to its own effect, so it can never bootstrap. The live channels
+  are per-loop RMSNorm gain deltas and a per-loop router logit bias, both
+  scale-free and zero-init (see `LoomConfig.per_loop_cond`), plus `loop_emb`
+  now expressed in units of the stream's own RMS. `cond_report()` surfaces all
+  three in the live metrics so a silently-inert pathway is visible immediately.
 - Concept FiLM applies to the loop-state entry point (zero-init in
   ConceptModulator), touching all R loops — plans steer computation, not logits.
 - KV caches: the core runs R times per token with different states, so every
@@ -30,6 +38,13 @@ from .config import LoomConfig
 from .layers import DenseBlock, MoEBlock, RMSNorm, build_rope_cache
 
 
+def _rms(x: torch.Tensor) -> torch.Tensor:
+    """Per-token RMS of the residual stream, detached — the unit that
+    conditioning terms are expressed in so they stay trainable as the stream
+    norm grows through training and across loops."""
+    return x.detach().pow(2).mean(-1, keepdim=True).sqrt()
+
+
 class LoomLM(nn.Module):
     def __init__(self, cfg: LoomConfig):
         super().__init__()
@@ -42,7 +57,8 @@ class LoomLM(nn.Module):
         )
         self.core = nn.ModuleList(
             MoEBlock(d, cfg.n_heads, cfg.n_kv_heads, cfg.n_experts, cfg.top_k,
-                     cfg.d_ff_expert, cfg.shared_expert, cfg.norm_eps)
+                     cfg.d_ff_expert, cfg.shared_expert, cfg.norm_eps,
+                     n_loops=cfg.n_loops if cfg.per_loop_cond else 0)
             for _ in range(cfg.core_layers)
         )
         self.coda = nn.ModuleList(
@@ -113,7 +129,7 @@ class LoomLM(nn.Module):
 
         def run(block, x, kv, *extra):
             if ckpt:
-                return checkpoint(block, x, cos, sin, kv, use_reentrant=False)
+                return checkpoint(block, x, cos, sin, kv, *extra, use_reentrant=False)
             return block(x, cos, sin, kv, *extra)
 
         new_past: list = []
@@ -135,14 +151,28 @@ class LoomLM(nn.Module):
 
         aux_lb = h.new_zeros(())
         aux_z = h.new_zeros(())
+        film_stats: dict = {}
         n_moe = 0
         s = e
         for r in range(cfg.n_loops):
-            u = self.adapter(torch.cat([s, e], dim=-1)) + self.loop_emb[r]
+            # Both injections are scaled by the stream's own RMS. A fixed-scale
+            # additive term is unusable here: the adapter output runs at RMS
+            # ~50-100 once trained, so an init-scale vector sits 1000x below
+            # the signal and its gradient is too small to ever bootstrap
+            # (measured: loop_emb ratio 0.001, dCE +0.0001 at 2.6B tokens).
+            u = self.adapter(torch.cat([s, e], dim=-1))
+            u = u + self.loop_emb[r] * _rms(u)
             if film is not None:
-                u = u * (1 + film[0]) + film[1]
+                rms = _rms(u)
+                if r == 0:  # FiLM health, sampled once per forward
+                    with torch.no_grad():
+                        film_stats = {
+                            "beta_frac": float(film[1].abs().mean() / rms.mean().clamp_min(1e-9)),
+                            "gamma_rms": float(film[0].pow(2).mean().sqrt()),
+                        }
+                u = u * (1 + film[0]) + film[1] * rms
             for blk in self.core:
-                u, kv, aux = run(blk, u, kv_in())
+                u, kv, aux = run(blk, u, kv_in(), r)
                 new_past.append(kv)
                 slot += 1
                 aux_lb = aux_lb + aux["lb"]
@@ -165,6 +195,7 @@ class LoomLM(nn.Module):
             "aux_lb": aux_lb,
             "aux_z": aux_z,
             "past": new_past if use_cache else None,
+            **film_stats,
         }
         if labels is not None:
             ce = F.cross_entropy(
@@ -185,6 +216,32 @@ class LoomLM(nn.Module):
         h = self.forward(input_ids)["hidden"]
         return pool_segments(h, self.cfg.segment_len)
 
+    # ---------- conditioning health ----------
+
+    @torch.no_grad()
+    def cond_report(self) -> dict:
+        """Is depth conditioning actually being used? Every channel here is
+        zero (or near-zero) at init and only matters if it moves off zero, so
+        these go in the live metrics — a silent no-op pathway is exactly the
+        failure that made `loop_emb` vestigial in the first run."""
+        out = {"loop_emb_frac": float(self.loop_emb.pow(2).mean(-1).sqrt().mean())}
+        gains, biases = [], []
+        for blk in self.core:
+            for nrm in (blk.attn_norm, blk.ffn_norm):
+                if nrm.cond is not None:
+                    # gain delta relative to the base gain it perturbs
+                    gains.append(
+                        float(nrm.cond.pow(2).mean(-1).sqrt().mean())
+                        / max(float(nrm.weight.pow(2).mean().sqrt()), 1e-9)
+                    )
+            if blk.moe.loop_bias is not None:
+                biases.append(float(blk.moe.loop_bias.abs().mean()))
+        if gains:
+            out["cond_gain_frac"] = sum(gains) / len(gains)
+        if biases:
+            out["cond_router_bias"] = sum(biases) / len(biases)
+        return out
+
     # ---------- optimizer partition ----------
 
     def param_groups(self) -> dict[str, list[nn.Parameter]]:
@@ -192,7 +249,10 @@ class LoomLM(nn.Module):
         orthogonalized update would mistreat: embeddings (tied head included),
         norms/1D, the router (keep routing adaptation snappy), the zero-init
         modulator, and the loop embeddings."""
-        adamw_name = ("embed", "lm_head", "router", "modulator", "loop_emb", "bos")
+        # `cond` and `loop_bias` are 2D but are gain/bias stacks, not linear
+        # maps — Muon's orthogonalized update would scramble them.
+        adamw_name = ("embed", "lm_head", "router", "modulator", "loop_emb", "bos",
+                      "cond", "loop_bias")
         muon, adamw = [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:

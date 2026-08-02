@@ -161,6 +161,12 @@ class LoomTrainer:
             "ce": out["ce"].item(), "concept": c_loss.item(),
             "aux_lb": out["aux_lb"].item(), "aux_z": out["aux_z"].item(),
         }
+        # FiLM health: beta is additive into the loop state, so it is the path
+        # most at risk of sitting inert. beta_frac ~ 0 with gamma_rms > 0 means
+        # the plan is only gating channels, never adding content.
+        for k in ("beta_frac", "gamma_rms"):
+            if k in out:
+                parts[k] = out[k]
         # Concept guidance should pay off (if at all) at segment BOUNDARIES —
         # the first tokens of a segment, where "which way is this going" is the
         # binding uncertainty — not in the locally-determined interior. Track
@@ -282,6 +288,12 @@ class LoomTrainer:
             if step % self.log_every == 0 or step == self.total_steps:
                 dt = time.perf_counter() - t_window
                 means = {k: sum(v) / len(v) for k, v in window.items() if v}
+                means.update(self.model.cond_report())  # cheap: small tensors, log-rate only
+                if self.device.type == "cuda":
+                    # peak since the last log — the number to tune
+                    # micro_batch_size/grad_checkpoint against
+                    means["vram_gb"] = torch.cuda.max_memory_allocated() / 2**30
+                    torch.cuda.reset_peak_memory_stats()
                 self.run.progress(step, means, lr=self.lr_adamw * frac, tok_per_sec=tok_window / max(dt, 1e-9))
                 window.clear()
                 tok_window = 0
