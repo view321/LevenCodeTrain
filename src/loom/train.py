@@ -161,6 +161,28 @@ class LoomTrainer:
             "ce": out["ce"].item(), "concept": c_loss.item(),
             "aux_lb": out["aux_lb"].item(), "aux_z": out["aux_z"].item(),
         }
+        # Concept guidance should pay off (if at all) at segment BOUNDARIES —
+        # the first tokens of a segment, where "which way is this going" is the
+        # binding uncertainty — not in the locally-determined interior. Track
+        # the split so the LCM's contribution is visible live, not inferred.
+        with torch.no_grad():
+            import torch.nn.functional as F
+
+            V = out["logits"].shape[-1]
+            nll = F.cross_entropy(  # bf16 logits are fine for a diagnostic
+                out["logits"][:, :-1].reshape(-1, V),
+                batch["labels"][:, 1:].reshape(-1),
+                ignore_index=-100, reduction="none",
+            ).reshape(ids.shape[0], -1)
+            offs = torch.arange(1, ids.shape[1], device=ids.device) % seg
+            valid = batch["labels"][:, 1:] != -100
+            k = max(seg // 4, 1)
+            b_mask = valid & (offs < k)
+            i_mask = valid & (offs >= k)
+            if b_mask.any():
+                parts["ce_boundary"] = nll[b_mask].mean().item()
+            if i_mask.any():
+                parts["ce_interior"] = nll[i_mask].mean().item()
         return loss, parts
 
     @torch.no_grad()
@@ -246,9 +268,10 @@ class LoomTrainer:
                 tok_window += batch["input_ids"].numel()
                 for k, v in parts.items():
                     window.setdefault(k, []).append(v)
-            torch.nn.utils.clip_grad_norm_(
+            gn = torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad], self.grad_clip
             )
+            window.setdefault("grad_norm", []).append(float(gn))
             if self.opt_muon:
                 self.opt_muon.step()
             self.opt_adamw.step()
