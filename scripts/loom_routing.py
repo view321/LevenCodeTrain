@@ -60,6 +60,9 @@ def main() -> None:
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--seq-len", type=int, default=None, help="default: model.max_seq_len")
     ap.add_argument("--device", default=None)
+    ap.add_argument("--zero-loop-emb", action="store_true",
+                    help="ablate loop_emb before measuring: separates routing that follows "
+                         "the evolving state from routing driven by the per-loop bias vector")
     ap.add_argument("--set", nargs="*", default=[], help="dotted overrides key=value")
     args = ap.parse_args()
 
@@ -82,6 +85,9 @@ def main() -> None:
     device = resolve_device(cfg_get(cfg, "run.device", "auto"))
     model = LoomLM.load(args.ckpt, device=device)
     model.eval()  # hooks assume one call per (loop, layer): no grad checkpointing
+    if args.zero_loop_emb:
+        model.loop_emb.data.zero_()
+        print("[ablation] loop_emb zeroed -- residual cross-loop routing is state-driven")
     mcfg = model.cfg
     bundle = load_tokenizer_bundle(cfg_get(cfg, "model.tokenizer_repo"))
     seq_len = args.seq_len or int(cfg_get(cfg, "model.max_seq_len", 1024))
@@ -108,7 +114,13 @@ def main() -> None:
         if top:
             print(f"  most re-routed tokens (loop 0 -> {mcfg.n_loops - 1}): {top}")
 
-    out = {"meta": {"ckpt": args.ckpt, "rows": args.rows, "seq_len": seq_len}, "per_source": reps}
+    out = {
+        "meta": {
+            "ckpt": args.ckpt, "rows": args.rows, "seq_len": seq_len,
+            "zero_loop_emb": args.zero_loop_emb,
+        },
+        "per_source": reps,
+    }
     if len(reps) > 1:
         control = cross_source_report(reps)
         out["cross_source"] = control
